@@ -8,4 +8,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 miden = "0.13"
-probe-account = { path = "../probe-account" }
+

@@ -1,12 +1,10 @@
-//! Integration harness for the probe.
-//!
-//! The executable test is intentionally kept next to the build helper. Once the
-//! v0.15 contract linker accepts the generated FPI interface, this is the only
-//! test that needs to be completed with the final MockChain network-account API.
+//! Integration harness and optional contract build helper for the probe.
+//! Runtime tests load the existing release packages without rebuilding them.
 
 use anyhow::{Context, Result};
 use cargo_miden::run;
 use miden_mast_package::Package;
+use miden_protocol::utils::serde::Deserializable;
 use std::path::Path;
 
 pub fn build_contract(path: &Path) -> Result<Package> {

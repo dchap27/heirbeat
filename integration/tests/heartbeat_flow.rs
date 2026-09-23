@@ -1,4 +1,4 @@
-//! Heartbeat execution uses committed notes produced by signature-authenticated wallets.
+//! Heartbeat and claim execution uses committed notes produced by signature-authenticated wallets.
 use std::{collections::BTreeSet, path::Path};
 
 use anyhow::{Context, Result};
@@ -60,51 +60,76 @@ struct Harness {
     chain: MockChain,
     owner: Account,
     attacker: Account,
+    beneficiary: Account,
     vault: AccountId,
     script: NoteScript,
+    claim_script: NoteScript,
 }
 
 impl Harness {
     fn new() -> Result<Self> {
+        Self::configured(TIMEOUT, 0)
+    }
+
+    fn configured(timeout: u32, initial_last: u32) -> Result<Self> {
         let mut builder = MockChain::builder();
         let auth = Auth::BasicAuth {
             auth_scheme: AuthScheme::Falcon512Poseidon2,
         };
         let owner = builder.add_existing_wallet(auth.clone())?;
+        let beneficiary = builder.add_existing_wallet(auth.clone())?;
         let attacker = builder.add_existing_wallet(auth)?;
         let script = NoteScript::from_package(&package("check-in-note")?)?;
+        let claim_script = NoteScript::from_package(&package("claim-note")?)?;
         let mut init = InitStorageData::default();
         init.insert_value(slot("owner").as_str(), owner_word(owner.id()))?;
-        init.insert_value(slot("last_check_in").as_str(), Word::default())?;
+        init.insert_value(slot("beneficiary").as_str(), owner_word(beneficiary.id()))?;
+        init.insert_value(slot("claimed").as_str(), Word::default())?;
+        init.insert_value(
+            slot("last_check_in").as_str(),
+            Word::from([initial_last, 0, 0, 0]),
+        )?;
         init.insert_value(
             slot("timeout_blocks").as_str(),
-            Word::new([Felt::from(TIMEOUT), Felt::ZERO, Felt::ZERO, Felt::ZERO]),
+            Word::new([Felt::from(timeout), Felt::ZERO, Felt::ZERO, Felt::ZERO]),
         )?;
         let component = AccountComponent::from_package(&package("heirbeat-vault")?, &init)?;
-        assert_eq!(component.storage_slots().len(), 3);
+        assert_eq!(component.storage_slots().len(), 5);
         let vault = AccountBuilder::new([42; 32])
             .account_type(AccountType::Public)
             .with_component(component)
             .with_auth_component(AuthNetworkAccount::with_allowed_notes(BTreeSet::from([
                 script.root(),
+                claim_script.root(),
             ]))?)
             .build_existing()?;
-        assert_network(&vault, script.root())?;
+        assert_network(&vault, [script.root(), claim_script.root()])?;
         builder.add_account(vault.clone())?;
         let chain = builder.build()?;
         let h = Self {
             chain,
             owner,
             attacker,
+            beneficiary,
             vault: vault.id(),
             script,
+            claim_script,
         };
         assert_eq!(
             h.state()?.storage().get_item(&slot("owner"))?,
             owner_word(h.owner.id())
         );
-        assert_eq!(scalar(h.state()?, "timeout_blocks")?, TIMEOUT);
-        assert_eq!(scalar(h.state()?, "last_check_in")?, 0);
+        assert_eq!(
+            h.state()?.storage().get_item(&slot("beneficiary"))?,
+            owner_word(h.beneficiary.id())
+        );
+        assert_eq!(scalar(h.state()?, "claimed")?, 0);
+        assert_eq!(
+            deadline(h.state()?)?,
+            u64::from(initial_last) + u64::from(timeout)
+        );
+        assert_eq!(scalar(h.state()?, "timeout_blocks")?, timeout);
+        assert_eq!(scalar(h.state()?, "last_check_in")?, initial_last);
         Ok(h)
     }
 
@@ -146,6 +171,82 @@ impl Harness {
         Ok(())
     }
 
+    fn claim_note(&self, sender: AccountId, serial: u32) -> Result<Note> {
+        let mut builder = MockChain::builder();
+        let note = NoteBuilder::new(sender, builder.rng_mut())
+            .serial_number(Word::from([serial, 0, 0, 0]))
+            .tag(NoteTag::with_account_target(self.vault).into())
+            .script(self.claim_script.clone())
+            .build()?;
+        assert!(note.assets().is_empty());
+        Ok(note)
+    }
+
+    fn advance_to(&mut self, reference: u32) -> Result<()> {
+        assert!(self.chain.latest_block_header().block_num().as_u32() <= reference);
+        while self.chain.latest_block_header().block_num().as_u32() < reference {
+            self.chain.prove_next_block()?;
+        }
+        Ok(())
+    }
+
+    async fn reject(&mut self, note: &Note) -> Result<()> {
+        let before = self.state()?.clone();
+        let result = self
+            .chain
+            .build_tx_context(self.vault, &[note.id()], &[])?
+            .build()?
+            .execute()
+            .await;
+        assert_transaction_executor_error!(
+            result,
+            MasmError::from_static_str("entered unreachable code")
+        );
+        self.chain.prove_next_block()?;
+        assert_eq!(self.state()?, &before);
+        assert!(!self.chain.is_note_consumed(&note.nullifier()));
+        Ok(())
+    }
+
+    async fn claim(&mut self, note: &Note, reference: u32) -> Result<()> {
+        assert_eq!(
+            self.chain.latest_block_header().block_num().as_u32(),
+            reference
+        );
+        let before = self.state()?.clone();
+        let executed = self
+            .chain
+            .build_tx_context(self.vault, &[note.id()], &[])?
+            .build()?
+            .execute()
+            .await?;
+        assert_eq!(executed.block_header().block_num().as_u32(), reference);
+        assert!(
+            executed.output_notes().is_empty(),
+            "claim must not create payouts"
+        );
+        self.chain.add_pending_executed_transaction(&executed)?;
+        self.chain.prove_next_block()?;
+        assert_eq!(scalar(self.state()?, "claimed")?, 1);
+        for name in ["owner", "beneficiary", "last_check_in", "timeout_blocks"] {
+            assert_eq!(
+                self.state()?.storage().get_item(&slot(name))?,
+                before.storage().get_item(&slot(name))?
+            );
+        }
+        assert_eq!(self.state()?.vault(), before.vault());
+        assert_eq!(
+            self.state()?.to_commitment(),
+            executed.final_account().to_commitment()
+        );
+        assert!(self.chain.is_note_consumed(&note.nullifier()));
+        assert_network(
+            self.state()?,
+            [self.script.root(), self.claim_script.root()],
+        )?;
+        Ok(())
+    }
+
     async fn check_in(&mut self, note: &Note) -> Result<u32> {
         let reference = self.chain.latest_block_header().block_num().as_u32();
         let executed = self
@@ -163,18 +264,21 @@ impl Harness {
             executed.final_account().to_commitment()
         );
         assert!(self.chain.is_note_consumed(&note.nullifier()));
-        assert_network(self.state()?, self.script.root())?;
+        assert_network(
+            self.state()?,
+            [self.script.root(), self.claim_script.root()],
+        )?;
         Ok(reference)
     }
 }
 
-fn assert_network(account: &Account, root: NoteScriptRoot) -> Result<()> {
+fn assert_network(account: &Account, roots: [NoteScriptRoot; 2]) -> Result<()> {
     assert!(account.is_public());
     assert_eq!(
         NetworkAccount::new(account.clone())?
             .allowed_notes()
             .allowed_script_roots(),
-        &BTreeSet::from([root])
+        &BTreeSet::from(roots)
     );
     assert!(
         NetworkAccountTxScriptAllowlist::try_from(account.storage())?
@@ -305,5 +409,122 @@ async fn unallowlisted_note_cannot_mutate_vault() -> Result<()> {
     assert_eq!(h.state()?, &before);
     assert!(!h.chain.is_note_consumed(&allowed.nullifier()));
     assert!(!h.chain.is_note_consumed(&denied.nullifier()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn early_claim_then_exact_deadline_and_terminal_state() -> Result<()> {
+    let mut h = Harness::configured(6, 0)?;
+    assert_ne!(h.owner.id(), h.beneficiary.id());
+    assert_eq!(deadline(h.state()?)?, 6);
+    let first = h.claim_note(h.beneficiary.id(), 10)?;
+    let repeated = h.claim_note(h.beneficiary.id(), 11)?;
+    h.send(h.beneficiary.id(), &[first.clone(), repeated.clone()])
+        .await?;
+    let heartbeat = h.note(h.owner.id(), 12)?;
+    h.send(h.owner.id(), &[heartbeat.clone()]).await?;
+    h.advance_to(5)?;
+    h.reject(&first).await?; // deadline - 1; rejected note remains available
+    assert_eq!(scalar(h.state()?, "claimed")?, 0);
+    assert_eq!(h.chain.latest_block_header().block_num().as_u32(), 6);
+    h.claim(&first, 6).await?; // exactly deadline, not the commitment block 7
+    let terminal_last = scalar(h.state()?, "last_check_in")?;
+    h.reject(&repeated).await?;
+    h.reject(&heartbeat).await?;
+    assert_eq!(scalar(h.state()?, "claimed")?, 1);
+    assert_eq!(scalar(h.state()?, "last_check_in")?, terminal_last);
+    println!(
+        "claim rejected at 5; accepted at deadline 6; repeat and post-claim heartbeat rejected"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn wrong_claimant_and_owner_cannot_claim_when_eligible() -> Result<()> {
+    let mut h = Harness::configured(6, 0)?;
+    assert_ne!(h.owner.id(), h.beneficiary.id());
+    assert_ne!(h.attacker.id(), h.beneficiary.id());
+    let attacker = h.claim_note(h.attacker.id(), 20)?;
+    let owner = h.claim_note(h.owner.id(), 21)?;
+    h.send(h.attacker.id(), &[attacker.clone()]).await?;
+    h.send(h.owner.id(), &[owner.clone()]).await?;
+    h.advance_to(6)?;
+    h.reject(&attacker).await?;
+    h.reject(&owner).await?;
+    assert_eq!(scalar(h.state()?, "claimed")?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn heartbeat_postpones_claim_until_new_exact_deadline() -> Result<()> {
+    let mut h = Harness::configured(6, 0)?;
+    let old_deadline = deadline(h.state()?)?;
+    let heartbeat = h.note(h.owner.id(), 30)?;
+    let claim = h.claim_note(h.beneficiary.id(), 31)?;
+    h.send(h.owner.id(), &[heartbeat.clone()]).await?;
+    h.send(h.beneficiary.id(), &[claim.clone()]).await?;
+    h.advance_to(3)?;
+    assert_eq!(h.check_in(&heartbeat).await?, 3);
+    let new_deadline = deadline(h.state()?)?;
+    assert_eq!((old_deadline, new_deadline), (6, 9));
+    h.advance_to(7)?; // strictly after old deadline, strictly before the new one
+    h.reject(&claim).await?;
+    assert_eq!(scalar(h.state()?, "claimed")?, 0);
+    h.advance_to(9)?;
+    h.claim(&claim, 9).await?;
+    println!("heartbeat at 3 extends deadline 6 -> 9; claim rejected at 7, accepted at 9");
+    Ok(())
+}
+
+#[tokio::test]
+async fn deadline_above_u32_max_does_not_wrap_into_eligibility() -> Result<()> {
+    let mut h = Harness::configured(u32::MAX, 1)?;
+    assert_eq!(deadline(h.state()?)?, 4_294_967_296);
+    let claim = h.claim_note(h.beneficiary.id(), 40)?;
+    h.send(h.beneficiary.id(), &[claim.clone()]).await?;
+    // Wrapping u32 addition would turn this deadline into 0 and incorrectly allow the claim.
+    h.reject(&claim).await?;
+    assert_eq!(scalar(h.state()?, "claimed")?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn attacker_cannot_spoof_beneficiary_sender() -> Result<()> {
+    let mut h = Harness::configured(6, 0)?;
+    let forged = h.claim_note(h.beneficiary.id(), 50)?;
+    assert_eq!(forged.metadata().sender(), h.beneficiary.id());
+    let result = AccountInterface::from_account(&h.attacker)
+        .build_send_notes_script(&[PartialNote::from(forged.clone())], None);
+    assert!(
+        matches!(result, Err(AccountInterfaceError::InvalidSenderAccount(id)) if id == h.beneficiary.id()),
+        "SECURITY BLOCKER: attacker send script accepted forged beneficiary metadata"
+    );
+    // Deliberately bypass the host guard, then inspect the kernel-produced sender.
+    let script = AccountInterface::from_account(&h.beneficiary)
+        .build_send_notes_script(&[PartialNote::from(forged.clone())], None)?;
+    let actual = h.claim_note(h.attacker.id(), 50)?;
+    let executed = h
+        .chain
+        .build_tx_context(h.attacker.id(), &[], &[])?
+        .tx_script(script)
+        .extend_expected_output_notes(vec![RawOutputNote::Full(actual.clone())])
+        .build()?
+        .execute()
+        .await?;
+    assert_eq!(executed.output_notes().num_notes(), 1);
+    let output = executed.output_notes().get_note(0);
+    assert_eq!(
+        output.metadata().sender(),
+        h.attacker.id(),
+        "SECURITY BLOCKER: kernel permitted forged beneficiary sender"
+    );
+    assert_ne!(output.id(), forged.id());
+    h.chain.add_pending_executed_transaction(&executed)?;
+    h.chain.prove_next_block()?;
+    assert!(h.chain.is_note_committed(&actual.id()));
+    assert!(!h.chain.is_note_committed(&forged.id()));
+    h.advance_to(6)?;
+    h.reject(&actual).await?; // Real committed output cannot authorize a beneficiary claim.
+    assert_eq!(scalar(h.state()?, "claimed")?, 0);
     Ok(())
 }

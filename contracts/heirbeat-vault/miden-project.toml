@@ -1,10 +1,10 @@
 [package]
-name = "probe-account"
+name = "heirbeat-vault"
 version = "0.1.0"
 
 [lib]
 kind = "account-component"
-namespace = "miden:probe-account/probe@0.1.0"
+namespace = "miden:heirbeat-vault/heirbeat-vault@0.1.0"
 
 [dependencies]
 miden-core = "*"

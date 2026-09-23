@@ -1,5 +1,5 @@
 [package]
-name = "touch-note"
+name = "heirbeat-vault"
 version = "0.1.0"
 edition = "2021"
 
@@ -8,4 +8,3 @@ crate-type = ["cdylib"]
 
 [dependencies]
 miden = "0.13"
-

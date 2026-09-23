@@ -1,0 +1,15 @@
+[package]
+name = "check-in-note"
+version = "0.1.0"
+
+[lib]
+kind = "note"
+namespace = "miden:check-in-note/check-in@0.1.0"
+
+[dependencies]
+miden-core = "*"
+miden-protocol = "*"
+heirbeat-vault = { path = "../heirbeat-vault" }
+
+[package.metadata.miden.dependencies]
+heirbeat-vault = { wit = "../heirbeat-vault/target/generated-wit/" }

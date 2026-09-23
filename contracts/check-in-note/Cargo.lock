@@ -223,6 +223,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "check-in-note"
+version = "0.1.0"
+dependencies = [
+ "miden",
+]
+
+[[package]]
 name = "cipher"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2166,13 +2173,6 @@ dependencies = [
  "equivalent",
  "indexmap",
  "serde",
-]
-
-[[package]]
-name = "probe-account"
-version = "0.1.0"
-dependencies = [
- "miden",
 ]
 
 [[package]]

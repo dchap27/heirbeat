@@ -1,4 +1,4 @@
-//! Integration harness and optional contract build helper for the probe.
+//! Integration harness and optional contract build helper for Heirbeat.
 //! Runtime tests load the existing release packages without rebuilding them.
 
 use anyhow::{Context, Result};

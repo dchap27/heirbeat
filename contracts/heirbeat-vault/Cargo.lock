@@ -773,6 +773,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "heirbeat-vault"
+version = "0.1.0"
+dependencies = [
+ "miden",
+]
+
+[[package]]
 name = "hkdf"
 version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2837,13 +2844,6 @@ name = "toml_writer"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
-
-[[package]]
-name = "touch-note"
-version = "0.1.0"
-dependencies = [
- "miden",
-]
 
 [[package]]
 name = "tracing"

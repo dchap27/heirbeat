@@ -1,5 +1,5 @@
 [package]
-name = "probe-account"
+name = "check-in-note"
 version = "0.1.0"
 edition = "2021"
 

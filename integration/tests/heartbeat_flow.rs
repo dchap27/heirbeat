@@ -10,20 +10,25 @@ use miden_protocol::{
     },
     asset::{Asset, AssetAmount, FungibleAsset, NonFungibleAsset},
     errors::MasmError,
-    note::{Note, NoteScript, NoteScriptRoot, NoteTag, PartialNote},
+    note::{Note, NoteScript, NoteScriptRoot, NoteTag, NoteType, PartialNote},
     transaction::RawOutputNote,
     utils::serde::Deserializable,
     Felt, Word,
 };
 use miden_standards::{
     account::{
-        auth::{AuthNetworkAccount, NetworkAccountNoteAllowlist, NetworkAccountTxScriptAllowlist},
+        access::AccessControl,
+        auth::{
+            AuthNetworkAccount, NetworkAccount, NetworkAccountNoteAllowlist,
+            NetworkAccountTxScriptAllowlist,
+        },
         fees::{BasicConstantFeePolicy, FeePolicyManager},
+        wallets::BasicWallet,
     },
     errors::standards::ERR_NOTE_SCRIPT_ALLOWLIST_NOTE_NOT_ALLOWED,
-    note::P2idNote,
+    note::{FeeSponsorshipNote, NetworkAccountConfigNote, P2idNote},
     testing::note::NoteBuilder,
-    tx_script::SendNotesTransactionScript,
+    tx_script::{ExpirationTransactionScript, SendNotesTransactionScript},
 };
 use miden_testing::{assert_transaction_executor_error, Auth, MockChain};
 
@@ -927,5 +932,176 @@ async fn deposit_recipient_is_enforced_independently_of_routing_tag() -> Result<
     // This vault supports the asset and script, but is not the committed recipient.
     h.reject(&deposit).await?;
     assert_eq!(balance(h.state()?), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fee_sponsorship_bootstraps_empty_network_account() -> Result<()> {
+    let fee_faucet: AccountId =
+        miden_protocol::testing::account_id::ACCOUNT_ID_FEE_FAUCET.try_into()?;
+    let inherited_faucet = FungibleAsset::mock_issuer();
+    let native_asset = FungibleAsset::new(fee_faucet, 10_000)?;
+    let fee_asset: Asset = native_asset.clone().into();
+
+    let auth = Auth::BasicAuth {
+        auth_scheme: AuthScheme::Falcon512Poseidon2,
+    };
+    // MockChain's verification_base_fee remains zero here: setting it nonzero makes the
+    // signature-authenticated owner transaction fail because MockTransactionBuilder does not
+    // attach the fee-conversion commitment to auth args. This test covers the standard paired
+    // sponsorship/P2ID path and state isolation; the live bootstrap below exercises real fee debit.
+    let mut chain_builder = MockChain::builder().fee_faucet_id(fee_faucet);
+    let owner = chain_builder.add_existing_wallet_with_assets(auth.clone(), [fee_asset.clone()])?;
+    let beneficiary = chain_builder.add_existing_wallet(auth)?;
+
+    let check_in = NoteScript::from_package(&package("check-in-note")?)?;
+    let claim = NoteScript::from_package(&package("claim-note")?)?;
+    let deposit = NoteScript::from_package(&package("deposit-note")?)?;
+    let p2id_root = P2idNote::script_root();
+    let sponsorship_root = FeeSponsorshipNote::script_root();
+    let heirbeat_roots = BTreeSet::from([check_in.root(), claim.root(), deposit.root()]);
+    let mut allowed_roots = heirbeat_roots.clone();
+    allowed_roots.insert(p2id_root);
+    let mut policy = BasicConstantFeePolicy::new()
+        .with_fee(p2id_root, AssetAmount::ZERO)
+        .with_fee(NetworkAccountConfigNote::script_root(), AssetAmount::ZERO)
+        .with_fee(sponsorship_root, AssetAmount::ZERO);
+    for root in &heirbeat_roots {
+        policy = policy.with_fee(*root, AssetAmount::ZERO);
+    }
+    let fee_manager = FeePolicyManager::builder()
+        .active_fee_policy(policy.into())
+        .fee_faucet_id(fee_faucet)
+        .build();
+
+    let mut init = InitStorageData::default();
+    init.insert_value(slot("asset_faucet").as_str(), owner_word(inherited_faucet))?;
+    init.insert_value(slot("owner").as_str(), owner_word(owner.id()))?;
+    init.insert_value(slot("beneficiary").as_str(), owner_word(beneficiary.id()))?;
+    init.insert_value(slot("claimed").as_str(), Word::default())?;
+    init.insert_value(slot("last_check_in").as_str(), Word::default())?;
+    init.insert_value(
+        slot("timeout_blocks").as_str(),
+        Word::new([Felt::from(10u32), Felt::ZERO, Felt::ZERO, Felt::ZERO]),
+    )?;
+    let component = AccountComponent::from_package(&package("heirbeat-vault")?, &init)?;
+    let account = AccountBuilder::new([0x5b; 32])
+        .account_type(AccountType::Public)
+        .with_component(component)
+        .with_component(BasicWallet)
+        .with_components(AccessControl::Ownable2Step { owner: owner.id() })
+        .with_components(AuthNetworkAccount::new(allowed_roots.clone(), fee_manager)?)
+        .build_existing()?;
+    let network_account = NetworkAccount::new(account.clone())?;
+    let all_roots = allowed_roots
+        .iter()
+        .copied()
+        .chain([NetworkAccountConfigNote::script_root(), sponsorship_root])
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        network_account.allowed_notes().allowed_script_roots(),
+        &all_roots
+    );
+    assert_eq!(
+        network_account.allowed_tx_scripts().allowed_script_roots(),
+        &BTreeSet::from([ExpirationTransactionScript::script_root()])
+    );
+    assert_eq!(
+        account.vault().get_balance(native_asset.id())?,
+        AssetAmount::ZERO
+    );
+    assert_eq!(
+        account
+            .vault()
+            .get_balance(FungibleAsset::new(inherited_faucet, 1)?.id())?,
+        AssetAmount::ZERO
+    );
+
+    let mut chain = {
+        chain_builder.add_account(account.clone())?;
+        chain_builder.build()?
+    };
+    let mut note_rng = MockChain::builder();
+    let feature: Note = P2idNote::builder()
+        .sender(owner.id())
+        .target(account.id())
+        .asset(FungibleAsset::new(fee_faucet, 1)?)
+        .note_type(NoteType::Public)
+        .generate_serial_number(note_rng.rng_mut())
+        .build()?
+        .into();
+    let sponsored_fee: Note = FeeSponsorshipNote::builder()
+        .sender(owner.id())
+        .target_account(account.id())
+        .feature_note_id(feature.id())
+        .asset(FungibleAsset::new(fee_faucet, 1_000)?)
+        .generate_serial_number(note_rng.rng_mut())
+        .build()?
+        .into();
+
+    let outputs = [feature.clone(), sponsored_fee.clone()];
+    let partial = outputs
+        .iter()
+        .cloned()
+        .map(PartialNote::from)
+        .collect::<Vec<_>>();
+    let send_script = SendNotesTransactionScript::new(
+        &chain.committed_account(owner.id())?.code_interface(),
+        &partial,
+    )?;
+    let sent = chain
+        .build_transaction(owner.id())
+        .foreign_accounts([chain.get_foreign_account_inputs(account.id())?])
+        .send_notes_script(&send_script)
+        .expected_output_notes(outputs.iter().cloned().map(RawOutputNote::Full).collect())
+        .build()?
+        .execute()
+        .await
+        .context("owner transaction emitting P2ID bootstrap and sponsorship notes")?;
+    chain.add_pending_executed_transaction(&sent)?;
+    chain.prove_next_block()?;
+
+    let before = chain.committed_account(account.id())?.clone();
+    assert_eq!(scalar(&before, "claimed")?, 0);
+    assert_eq!(scalar(&before, "last_check_in")?, 0);
+    assert_eq!(scalar(&before, "timeout_blocks")?, 10);
+    let bootstrapped = chain
+        .build_transaction(account.id())
+        .foreign_accounts([chain.get_foreign_account_inputs(owner.id())?])
+        .authenticated_input_note(feature.id())
+        .authenticated_input_note(sponsored_fee.id())
+        .build()?
+        .execute()
+        .await
+        .context("empty Network Account consuming P2ID and its fee sponsorship")?;
+    assert!(bootstrapped.output_notes().is_empty());
+    chain.add_pending_executed_transaction(&bootstrapped)?;
+    chain.prove_next_block()?;
+
+    let after = chain.committed_account(account.id())?;
+    let native_fee_balance = after.vault().get_balance(native_asset.id())?;
+    assert_eq!(native_fee_balance, AssetAmount::new(1_001)?);
+    assert_eq!(
+        after
+            .vault()
+            .get_balance(FungibleAsset::new(inherited_faucet, 1)?.id(),)?,
+        AssetAmount::ZERO
+    );
+    assert_eq!(
+        after.storage().get_item(&slot("owner"))?,
+        owner_word(owner.id())
+    );
+    assert_eq!(
+        after.storage().get_item(&slot("beneficiary"))?,
+        owner_word(beneficiary.id())
+    );
+    assert_eq!(scalar(after, "claimed")?, 0);
+    assert_eq!(scalar(after, "last_check_in")?, 0);
+    assert_eq!(scalar(after, "timeout_blocks")?, 10);
+    assert!(chain.is_note_consumed(&feature.nullifier()));
+    assert!(chain.is_note_consumed(&sponsored_fee.nullifier()));
+    assert!(chain.is_note_committed(&feature.id()));
+    assert!(chain.is_note_committed(&sponsored_fee.id()));
+
     Ok(())
 }

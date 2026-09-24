@@ -2002,6 +2002,7 @@ dependencies = [
  "miden-standards",
  "miden-testing",
  "miden-tx",
+ "rand 0.10.2",
  "tokio",
 ]
 

@@ -22,3 +22,4 @@ target
 
 /integration/store.sqlite3
 /integration/keystore/
+/.local/testnet-v016/

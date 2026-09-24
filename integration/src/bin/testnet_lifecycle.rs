@@ -44,7 +44,8 @@ use miden_standards::{
         wallets::BasicWallet,
     },
     note::{
-        FeeSponsorshipNote, NetworkAccountConfig, NetworkAccountConfigNote, P2idNote,
+        FeeSponsorshipNote, FeeSponsorshipNoteStorage, NetworkAccountConfig,
+        NetworkAccountConfigNote, NetworkAccountTarget, NoteExecutionHint, P2idNote,
         P2idNoteStorage,
     },
     testing::note::NoteBuilder,
@@ -354,7 +355,7 @@ async fn deploy_durable_faucet(faucet_id: AccountId) -> Result<()> {
     Ok(())
 }
 
-async fn mint_faucet_probe(faucet_id: AccountId, fee_note_hex: &str) -> Result<()> {
+async fn mint_faucet_asset(faucet_id: AccountId, amount: u64, fee_note_hex: &str) -> Result<()> {
     let mut client = client().await?;
     client.sync_state().await?;
     let owner = parse_id("0xa61714a99ec7619109e397cbac32cd")?;
@@ -369,11 +370,9 @@ async fn mint_faucet_probe(faucet_id: AccountId, fee_note_hex: &str) -> Result<(
         .context("deployed faucet is not tracked")?;
     let faucet = FungibleFaucet::try_from(&faucet_account)?;
     ensure!(faucet_account.is_public(), "faucet is not public");
-    ensure!(
-        faucet.token_supply() == AssetAmount::ZERO,
-        "faucet probe expects a zero starting supply"
-    );
-    let asset = FungibleAsset::new(faucet_id, 10)?;
+    ensure!(amount > 0, "mint amount must be positive");
+    let supply_before = faucet.token_supply();
+    let asset = FungibleAsset::new(faucet_id, amount)?;
     let fee_faucet = parse_id(FEE_FAUCET)?;
     let fee_asset = FungibleAsset::new(fee_faucet, 1)?;
     let fee_balance_before = faucet_account.vault().get_balance(fee_asset.id())?;
@@ -448,12 +447,12 @@ async fn mint_faucet_probe(faucet_id: AccountId, fee_note_hex: &str) -> Result<(
         .context("faucet state disappeared after mint")?;
     let faucet_after = FungibleFaucet::try_from(&faucet_after)?;
     ensure!(
-        owner_after.as_u64() == owner_before.as_u64() + 10,
-        "owner probe balance did not increase by exactly ten: {owner_before} -> {owner_after}"
+        owner_after.as_u64() == owner_before.as_u64() + amount,
+        "owner balance did not increase by exactly {amount}: {owner_before} -> {owner_after}"
     );
     ensure!(
-        faucet_after.token_supply() == AssetAmount::from(10u32),
-        "faucet supply did not increase to exactly ten"
+        faucet_after.token_supply().as_u64() == supply_before.as_u64() + amount,
+        "faucet supply did not increase by exactly {amount}"
     );
     let consumed_record = client
         .get_input_note(note.id())
@@ -461,7 +460,7 @@ async fn mint_faucet_probe(faucet_id: AccountId, fee_note_hex: &str) -> Result<(
         .context("consumed probe note record is missing")?;
     ensure!(
         consumed_record.consumer_account() == Some(owner),
-        "probe note was not consumed by the owner"
+        "mint note was not consumed by the owner"
     );
     println!("faucet_id={faucet_id}");
     println!("faucet_fee_funding_note_id={fee_funding_id}");
@@ -469,13 +468,13 @@ async fn mint_faucet_probe(faucet_id: AccountId, fee_note_hex: &str) -> Result<(
     println!("faucet_native_fee_topup=151");
     println!("mint_transaction={mint_tx}");
     println!("mint_committed_block={mint_block}");
-    println!("probe_note_id={}", note.id());
-    println!("probe_note_amount=10");
-    println!("probe_note_recipient={owner}");
-    println!("probe_note_consumption_transaction={consume_tx}");
-    println!("probe_note_consumption_block={consume_block}");
-    println!("owner_probe_balance_before={owner_before}");
-    println!("owner_probe_balance_after={owner_after}");
+    println!("mint_note_id={}", note.id());
+    println!("mint_amount={amount}");
+    println!("mint_recipient={owner}");
+    println!("mint_consumption_transaction={consume_tx}");
+    println!("mint_consumption_block={consume_block}");
+    println!("owner_balance_before={owner_before}");
+    println!("owner_balance_after={owner_after}");
     println!("faucet_supply_after={}", faucet_after.token_supply());
     Ok(())
 }
@@ -814,21 +813,20 @@ async fn consume_faucet_bootstrap(
     Ok(())
 }
 
-async fn fund_faucet_deployment(faucet_id: AccountId, amount: u64) -> Result<()> {
+async fn fund_account_native(sender: AccountId, target: AccountId, amount: u64) -> Result<()> {
     let mut client = client().await?;
     let sync = client.sync_state().await?;
-    let beneficiary = parse_id("0x4181277bcf64381105ee61baadb5bc")?;
     let fee_faucet = parse_id(FEE_FAUCET)?;
     let keys = FilesystemKeyStore::new(state_dir().join(".miden/keystore"))?;
     ensure!(
-        !keys.get_keys_for_account(&beneficiary).await?.is_empty(),
-        "beneficiary signer is missing from the durable keystore"
+        !keys.get_keys_for_account(&sender).await?.is_empty(),
+        "native fee funding sender key is missing from the durable keystore"
     );
     let asset = FungibleAsset::new(fee_faucet, amount)?;
     let mut note_rng = rng();
     let note: Note = P2idNote::builder()
-        .sender(beneficiary)
-        .target(faucet_id)
+        .sender(sender)
+        .target(target)
         .asset(asset)
         .note_type(NoteType::Public)
         .generate_serial_number(&mut note_rng)
@@ -836,16 +834,17 @@ async fn fund_faucet_deployment(faucet_id: AccountId, amount: u64) -> Result<()>
         .into();
     let txid = client
         .submit_new_transaction(
-            beneficiary,
+            sender,
             TransactionRequestBuilder::new()
                 .own_output_notes([note.clone()])
                 .expected_ntx_scripts(vec![P2idNote::script()])
                 .build()?,
         )
         .await?;
-    println!("faucet_fee_funding_transaction={txid}");
-    println!("faucet_fee_funding_note_id={}", note.id());
-    println!("faucet_fee_funding_sender={beneficiary}");
+    println!("native_fee_funding_transaction={txid}");
+    println!("native_fee_funding_note_id={}", note.id());
+    println!("native_fee_funding_sender={sender}");
+    println!("native_fee_funding_target={target}");
     println!("faucet_fee_funding_amount={amount}");
     let synced = client.sync_state().await?;
     println!("synced_block_after_funding={}", synced.block_num);
@@ -1948,7 +1947,349 @@ async fn account_history(account_id: AccountId) -> Result<()> {
             record.block_num,
             record.transaction_header.output_notes().len()
         );
+        for output in record.transaction_header.output_notes() {
+            let note_id = output.id();
+            let details = rpc.get_notes_by_id(&[note_id]).await?;
+            for detail in details {
+                match detail {
+                    miden_client::rpc::domain::note::FetchedNote::Public(note, _) => println!(
+                        "output_note_id={note_id} transaction_id={} sender={} script_root={} assets={:?}",
+                        record.transaction_header.id(),
+                        note.metadata().sender(),
+                        note.recipient().script().root(),
+                        note.assets()
+                    ),
+                    _ => println!("output_note_id={note_id} transaction_id={} note_details=not_public", record.transaction_header.id()),
+                }
+            }
+        }
     }
+    Ok(())
+}
+
+async fn inspect_vault_state(
+    vault_id: AccountId,
+    owner: AccountId,
+    beneficiary: AccountId,
+    asset_faucet: AccountId,
+) -> Result<()> {
+    let mut client = client().await?;
+    let sync = client.sync_state().await?;
+    let account = client
+        .get_account(vault_id)
+        .await?
+        .context("vault account is missing after sync")?;
+    let network_account = NetworkAccount::new(account.clone())?;
+    let inherited = account
+        .vault()
+        .get_balance(FungibleAsset::new(asset_faucet, 1)?.id())?;
+    let native_faucet = parse_id(FEE_FAUCET)?;
+    let native = account
+        .vault()
+        .get_balance(FungibleAsset::new(native_faucet, 1)?.id())?;
+    let stored_owner = account
+        .storage()
+        .get_item(&StorageSlotName::new(slot("owner"))?)?;
+    let stored_beneficiary = account
+        .storage()
+        .get_item(&StorageSlotName::new(slot("beneficiary"))?)?;
+    ensure!(stored_owner == owner_word(owner), "vault owner differs");
+    ensure!(
+        stored_beneficiary == owner_word(beneficiary),
+        "vault beneficiary differs"
+    );
+    println!("sync_block={}", sync.block_num);
+    println!("vault_id={vault_id}");
+    println!("network_account_recognized=true");
+    println!("owner={owner}");
+    println!("beneficiary={beneficiary}");
+    println!(
+        "last_check_in={:?}",
+        account
+            .storage()
+            .get_item(&StorageSlotName::new(slot("last_check_in"))?)?
+    );
+    println!(
+        "claimed={:?}",
+        account
+            .storage()
+            .get_item(&StorageSlotName::new(slot("claimed"))?)?
+    );
+    println!("inherited_faucet={asset_faucet}");
+    println!("inherited_balance={inherited}");
+    println!("native_fee_faucet={native_faucet}");
+    println!("native_fee_balance={native}");
+    println!(
+        "note_allowlist={:?}",
+        network_account.allowed_notes().allowed_script_roots()
+    );
+    println!(
+        "transaction_script_allowlist={:?}",
+        network_account.allowed_tx_scripts().allowed_script_roots()
+    );
+    Ok(())
+}
+
+async fn inspect_network_notes(note_ids: &[String]) -> Result<()> {
+    let mut client = client().await?;
+    let sync = client.sync_state().await?;
+    let rpc = VerifyingRpcClient::new(GrpcClient::new(&Endpoint::testnet(), 10_000));
+    let (header, _) = rpc.get_block_header_by_number(None, false).await?;
+    println!("synced_block={}", sync.block_num);
+    println!("public_chain_block={}", header.block_num());
+
+    for note_hex in note_ids {
+        let note_id = miden_protocol::note::NoteId::try_from_hex(note_hex)?;
+        let input_record = client.get_input_note(note_id).await?;
+        let output_record = client.get_output_note(note_id).await?;
+        println!("note_id={note_id}");
+        println!("local_input_note_tracked={}", input_record.is_some());
+        println!("local_output_note_tracked={}", output_record.is_some());
+        if let Some(record) = &input_record {
+            println!("local_input_note_committed={}", record.is_committed());
+            println!("local_input_note_consumer={:?}", record.consumer_account());
+        }
+        if let Some(record) = &output_record {
+            println!("local_output_note_committed={}", record.is_committed());
+        }
+
+        let fetched = rpc.get_notes_by_id(&[note_id]).await?;
+        if fetched.is_empty() {
+            println!("chain_note_found=false");
+        }
+        for fetched_note in fetched {
+            match fetched_note {
+                miden_client::rpc::domain::note::FetchedNote::Public(note, proof) => {
+                    let nullifier = note.nullifier();
+                    let nullifier_updates = rpc
+                        .sync_nullifiers(
+                            &[nullifier.prefix()],
+                            BlockNumber::GENESIS,
+                            header.block_num(),
+                        )
+                        .await?;
+                    let consumed_at = nullifier_updates
+                        .iter()
+                        .find(|update| update.nullifier == nullifier)
+                        .map(|update| update.block_num);
+                    let network_target = NetworkAccountTarget::try_from(note.attachments()).ok();
+                    println!("chain_note_found=true");
+                    println!("note_type={:?}", note.metadata().note_type());
+                    println!("note_sender={}", note.metadata().sender());
+                    println!("note_script_root={}", note.recipient().script().root());
+                    println!("note_assets={:?}", note.assets());
+                    println!("note_committed_block={}", proof.location().block_num());
+                    println!("note_nullifier={nullifier}");
+                    println!("note_nullifier_consumed_at={consumed_at:?}");
+                    println!("network_account_target_attachment={network_target:?}");
+                    if note.recipient().script().root() == FeeSponsorshipNote::script_root() {
+                        let storage = FeeSponsorshipNoteStorage::try_from(
+                            note.recipient().storage().items(),
+                        )?;
+                        println!("sponsorship_feature_note_id={}", storage.feature_note_id());
+                        println!("sponsorship_reclaimer={}", storage.reclaimer());
+                        println!("sponsorship_reclaim_height={:?}", storage.reclaim_height());
+                    }
+                }
+                _ => println!("chain_note_found=true note_visibility=not_public"),
+            }
+        }
+
+        match rpc.get_network_note_status(note_id).await {
+            Ok(status) => {
+                println!("network_builder_status={}", status.status);
+                println!("network_builder_attempt_count={}", status.attempt_count);
+                println!("network_builder_last_error={:?}", status.last_error);
+                println!(
+                    "network_builder_last_attempt_block={:?}",
+                    status.last_attempt_block_num
+                );
+            }
+            Err(error) => println!("network_builder_status_error={error}"),
+        }
+    }
+    Ok(())
+}
+
+async fn inspect_network_deposit_construction(
+    sender: AccountId,
+    vault: AccountId,
+    asset_faucet: AccountId,
+    amount: u64,
+    sponsorship_amount: u64,
+) -> Result<()> {
+    ensure!(amount > 0, "deposit amount must be positive");
+    ensure!(
+        vault == parse_id("0x39fcc854fe715ad1446afb9859df04")?,
+        "this construction diagnostic is pinned to the current Heirbeat vault"
+    );
+    let mut client = client().await?;
+    client.sync_state().await?;
+    let account = client
+        .get_account(vault)
+        .await?
+        .context("Heirbeat vault is not tracked in the durable client store")?;
+    let network_account = NetworkAccount::new(account)?;
+    let script = NoteScript::from_package(&package("deposit-note")?)?;
+    ensure!(
+        network_account
+            .allowed_notes()
+            .allowed_script_roots()
+            .contains(&script.root()),
+        "deposit-note root is not allowlisted by the vault"
+    );
+
+    let target = NetworkAccountTarget::new(vault, NoteExecutionHint::Always)?;
+    let mut note_rng = rng();
+    let builder = NoteBuilder::new(sender, rng())
+        .tag(NoteTag::with_account_target(vault).into())
+        .note_type(NoteType::Public)
+        .script(script.clone())
+        .add_assets([FungibleAsset::new(asset_faucet, amount)?.into()])
+        .note_storage([vault.suffix(), vault.prefix().as_felt()])?
+        .attachment(target);
+    let feature_note: Note = builder.build()?;
+    let wrapped = miden_standards::note::AccountTargetNetworkNote::new(feature_note.clone())?;
+    ensure!(
+        wrapped.target_account_id() == vault,
+        "canonical network target attachment does not name the current vault"
+    );
+    ensure!(
+        feature_note.recipient().script().root() == script.root(),
+        "constructed feature note does not use deposit-note"
+    );
+
+    let sponsorship: Note = FeeSponsorshipNote::builder()
+        .sender(sender)
+        .target_account(vault)
+        .feature_note_id(feature_note.id())
+        .asset(FungibleAsset::new(
+            parse_id(FEE_FAUCET)?,
+            sponsorship_amount,
+        )?)
+        .generate_serial_number(&mut note_rng)
+        .build()?
+        .into();
+    let sponsorship_storage =
+        FeeSponsorshipNoteStorage::try_from(sponsorship.recipient().storage().items())?;
+    ensure!(
+        sponsorship_storage.feature_note_id() == feature_note.id(),
+        "sponsorship note does not bind to the constructed deposit note"
+    );
+
+    println!("submitted=false");
+    println!("sender={sender}");
+    println!("target_account={}", wrapped.target_account_id());
+    println!("target_attachment={:?}", wrapped.target());
+    println!("routing_tag={:?}", feature_note.metadata().tag());
+    println!("deposit_note_id={}", feature_note.id());
+    println!("deposit_script_root={}", script.root());
+    println!("deposit_root_allowlisted=true");
+    println!("deposit_assets={:?}", feature_note.assets());
+    println!(
+        "deposit_note_type={:?}",
+        feature_note.metadata().note_type()
+    );
+    println!(
+        "deposit_recipient_storage={:?}",
+        feature_note.recipient().storage()
+    );
+    println!("sponsorship_note_id={}", sponsorship.id());
+    println!(
+        "sponsorship_script_root={}",
+        sponsorship.recipient().script().root()
+    );
+    println!("sponsorship_assets={:?}", sponsorship.assets());
+    println!(
+        "sponsorship_feature_note_id={}",
+        sponsorship_storage.feature_note_id()
+    );
+    println!("sponsorship_reclaimer={}", sponsorship_storage.reclaimer());
+    println!(
+        "sponsorship_reclaim_height={:?}",
+        sponsorship_storage.reclaim_height()
+    );
+    Ok(())
+}
+
+async fn submit_targeted_deposit_funding(
+    sender: AccountId,
+    vault: AccountId,
+    asset_faucet: AccountId,
+    amount: u64,
+) -> Result<()> {
+    const SPONSORSHIP_AMOUNT: u64 = 150;
+    ensure!(amount > 0, "deposit amount must be positive");
+    let mut client = client().await?;
+    let sync = client.sync_state().await?;
+    let account = client
+        .get_account(vault)
+        .await?
+        .context("Heirbeat vault is not tracked in the durable client store")?;
+    let network_account = NetworkAccount::new(account)?;
+    let script = NoteScript::from_package(&package("deposit-note")?)?;
+    ensure!(
+        network_account
+            .allowed_notes()
+            .allowed_script_roots()
+            .contains(&script.root()),
+        "deposit-note root is not allowlisted by the vault"
+    );
+    let target = NetworkAccountTarget::new(vault, NoteExecutionHint::Always)?;
+    let mut serial_rng = rng();
+    let feature_note: Note = NoteBuilder::new(sender, rng())
+        .tag(NoteTag::with_account_target(vault).into())
+        .note_type(NoteType::Public)
+        .script(script.clone())
+        .add_assets([FungibleAsset::new(asset_faucet, amount)?.into()])
+        .note_storage([vault.suffix(), vault.prefix().as_felt()])?
+        .attachment(target)
+        .build()?;
+    let network_note = miden_standards::note::AccountTargetNetworkNote::new(feature_note.clone())?;
+    ensure!(
+        network_note.target_account_id() == vault,
+        "constructed feature note is not targeted at the vault"
+    );
+    let fee_faucet = parse_id(FEE_FAUCET)?;
+    let sponsorship_note: Note = FeeSponsorshipNote::builder()
+        .sender(sender)
+        .target_account(vault)
+        .feature_note_id(feature_note.id())
+        .asset(FungibleAsset::new(fee_faucet, SPONSORSHIP_AMOUNT)?)
+        .generate_serial_number(&mut serial_rng)
+        .build()?
+        .into();
+    let keys = FilesystemKeyStore::new(state_dir().join(".miden/keystore"))?;
+    ensure!(
+        !keys.get_keys_for_account(&sender).await?.is_empty(),
+        "deposit funding signer is unavailable"
+    );
+    let txid = client
+        .submit_new_transaction(
+            sender,
+            TransactionRequestBuilder::new()
+                .own_output_notes([feature_note.clone(), sponsorship_note.clone()])
+                .expected_ntx_scripts(vec![script, FeeSponsorshipNote::script()])
+                .build()?,
+        )
+        .await?;
+    let committed = committed_block(&mut client, txid).await?;
+    println!("submitted_owner_funding_transaction_only=true");
+    println!("starting_sync_block={}", sync.block_num);
+    println!("owner_transaction_id={txid}");
+    println!("owner_transaction_committed_block={committed}");
+    println!("deposit_note_id={}", feature_note.id());
+    println!("deposit_note_target={}", network_note.target_account_id());
+    println!("deposit_target_attachment={:?}", network_note.target());
+    println!(
+        "deposit_note_root={}",
+        feature_note.recipient().script().root()
+    );
+    println!("deposit_amount={amount}");
+    println!("sponsorship_note_id={}", sponsorship_note.id());
+    println!("sponsorship_amount={SPONSORSHIP_AMOUNT}");
+    println!("sponsorship_feature_note_id={}", feature_note.id());
+    println!("next=inspect-network-notes <deposit-note-id> <sponsorship-note-id>");
     Ok(())
 }
 
@@ -2015,6 +2356,130 @@ async fn send_note(
     Ok(())
 }
 
+async fn execute_heirbeat_note(
+    kind: &str,
+    sender: AccountId,
+    vault: AccountId,
+    asset_faucet: AccountId,
+    amount: u64,
+    sponsorship_amount: u64,
+) -> Result<()> {
+    ensure!(
+        sponsorship_amount > 0,
+        "sponsorship amount must be positive"
+    );
+    let script_name = match kind {
+        "check-in" => "check-in-note",
+        "claim" => "claim-note",
+        "deposit" => "deposit-note",
+        _ => bail!("stage must be check-in, claim, or deposit"),
+    };
+    let mut client = client().await?;
+    let sync = client.sync_state().await?;
+    let rpc = VerifyingRpcClient::new(GrpcClient::new(&Endpoint::testnet(), 10_000));
+    let (header, _) = rpc.get_block_header_by_number(None, false).await?;
+    let script = NoteScript::from_package(&package(script_name)?)?;
+    let mut note_rng = rng();
+    let mut builder = NoteBuilder::new(sender, rng())
+        .tag(NoteTag::with_account_target(vault).into())
+        .script(script.clone());
+    if kind == "deposit" {
+        ensure!(amount > 0, "deposit amount must be positive");
+        let asset: Asset = FungibleAsset::new(asset_faucet, amount)?.into();
+        builder = builder
+            .add_assets([asset])
+            .note_storage([vault.suffix(), vault.prefix().as_felt()])?;
+    } else {
+        ensure!(amount == 0, "only deposit notes may carry assets");
+    }
+    let feature_note: Note = builder.build()?;
+    let feature_note_id = feature_note.id();
+    let fee_faucet = parse_id(FEE_FAUCET)?;
+    let sponsorship_note: Note = FeeSponsorshipNote::builder()
+        .sender(sender)
+        .target_account(vault)
+        .feature_note_id(feature_note_id)
+        .asset(FungibleAsset::new(fee_faucet, sponsorship_amount)?)
+        .generate_serial_number(&mut note_rng)
+        .build()?
+        .into();
+    let sponsorship_note_id = sponsorship_note.id();
+    let keys = FilesystemKeyStore::new(state_dir().join(".miden/keystore"))?;
+    ensure!(
+        !keys.get_keys_for_account(&sender).await?.is_empty(),
+        "feature-note sender key is unavailable"
+    );
+    let fee_balance_before = client
+        .get_account(sender)
+        .await?
+        .context("feature-note sender is not tracked")?
+        .vault()
+        .get_balance(FungibleAsset::new(fee_faucet, 1)?.id())?;
+    let funding_tx = client
+        .submit_new_transaction(
+            sender,
+            TransactionRequestBuilder::new()
+                .own_output_notes([feature_note.clone(), sponsorship_note.clone()])
+                .expected_ntx_scripts(vec![script.clone(), FeeSponsorshipNote::script()])
+                .build()?,
+        )
+        .await?;
+    let funding_block = committed_block(&mut client, funding_tx).await?;
+    let mut expected_scripts = vec![script, FeeSponsorshipNote::script()];
+    if kind == "claim" {
+        expected_scripts.push(P2idNote::script());
+    }
+    let vault_tx = client
+        .submit_new_transaction(
+            vault,
+            TransactionRequestBuilder::new()
+                .input_notes([(feature_note, None), (sponsorship_note, None)])
+                .expected_ntx_scripts(expected_scripts)
+                .build()?,
+        )
+        .await?;
+    let vault_block = committed_block(&mut client, vault_tx).await?;
+    let updated = client
+        .get_account(vault)
+        .await?
+        .context("Heirbeat account missing after feature-note execution")?;
+    println!("kind={kind}");
+    println!("starting_sync_block={}", sync.block_num);
+    println!("current_node_block={}", header.block_num());
+    println!(
+        "verification_base_fee={}",
+        header.fee_parameters().verification_base_fee()
+    );
+    println!("sender_native_fee_balance_before={fee_balance_before}");
+    println!("feature_note_id={feature_note_id}");
+    println!("sponsorship_note_id={sponsorship_note_id}");
+    println!("feature_funding_transaction_id={funding_tx}");
+    println!("feature_funding_committed_block={funding_block}");
+    println!("vault_transaction_id={vault_tx}");
+    println!("vault_committed_block={vault_block}");
+    println!(
+        "vault_last_check_in={:?}",
+        updated
+            .storage()
+            .get_item(&StorageSlotName::new(slot("last_check_in"))?)?
+    );
+    println!(
+        "vault_claimed={:?}",
+        updated
+            .storage()
+            .get_item(&StorageSlotName::new(slot("claimed"))?)?
+    );
+    println!(
+        "vault_inherited_balance={}",
+        updated
+            .vault()
+            .get_balance(FungibleAsset::new(asset_faucet, 1)?.id())?
+    );
+    println!("feature_note_consumed=true");
+    println!("sponsorship_note_consumed=true");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -2043,11 +2508,11 @@ async fn main() -> Result<()> {
         Some("consume-faucet-bootstrap") if args.len() == 5 => {
             consume_faucet_bootstrap(parse_id(&args[1])?, &args[2], &args[3], &args[4]).await
         },
-        Some("fund-faucet-deployment") if args.len() == 3 => {
-            fund_faucet_deployment(parse_id(&args[1])?, args[2].parse()?).await
+        Some("fund-native") if args.len() == 4 => {
+            fund_account_native(parse_id(&args[1])?, parse_id(&args[2])?, args[3].parse()?).await
         },
-        Some("mint-probe") if args.len() == 3 => {
-            mint_faucet_probe(parse_id(&args[1])?, &args[2]).await
+        Some("mint-asset") if args.len() == 4 => {
+            mint_faucet_asset(parse_id(&args[1])?, args[2].parse()?, &args[3]).await
         },
         Some("consume-mint-probe") if args.len() == 4 => {
             consume_mint_probe(parse_id(&args[1])?, &args[2], &args[3]).await
@@ -2100,12 +2565,52 @@ async fn main() -> Result<()> {
         Some("account-history") if args.len() == 2 => {
             account_history(parse_id(&args[1])?).await
         },
+        Some("inspect-vault-state") if args.len() == 5 => {
+            inspect_vault_state(
+                parse_id(&args[1])?,
+                parse_id(&args[2])?,
+                parse_id(&args[3])?,
+                parse_id(&args[4])?,
+            )
+            .await
+        },
+        Some("inspect-network-notes") if args.len() == 3 => {
+            inspect_network_notes(&args[1..]).await
+        }
+        Some("inspect-network-deposit") if args.len() == 5 => {
+            inspect_network_deposit_construction(
+                parse_id(&args[1])?,
+                parse_id(&args[2])?,
+                parse_id(&args[3])?,
+                args[4].parse()?,
+                150,
+            )
+            .await
+        }
+        Some("submit-targeted-deposit") if args.len() == 5 => {
+            submit_targeted_deposit_funding(
+                parse_id(&args[1])?,
+                parse_id(&args[2])?,
+                parse_id(&args[3])?,
+                args[4].parse()?,
+            )
+            .await
+        }
         Some(stage @ ("check-in" | "claim")) if args.len() == 3 => {
             send_note(stage, parse_id(&args[1])?, parse_id(&args[2])?, None, 0).await
         },
         Some("deposit") if args.len() == 5 => {
             send_note("deposit", parse_id(&args[1])?, parse_id(&args[2])?, Some(parse_id(&args[3])?), args[4].parse()?).await
         },
-        _ => bail!("usage: testnet_lifecycle preflight | create-faucet | verify-faucet <faucet> | deploy-faucet <faucet> | fund-faucet-deployment <faucet> <amount> | consume-faucet-bootstrap <faucet> <p2id-note-id> <sponsorship-note-id> <direct-fee-p2id-note-id> | mint-probe <faucet> <committed-native-fee-note-id> | status | inspect-faucet <faucet> | audit-asset <faucet> | audit-asset-db <faucet> <db-copy> | create-vault <owner> <beneficiary> <asset-faucet> <timeout> | verify-vault <vault> <owner> <beneficiary> <asset-faucet> | remove-bootstrap-p2id <vault> <owner> <beneficiary> <asset-faucet> | consume-config-notes <vault> <config-note-id> <sponsorship-note-id> | block-transactions <block> <account> | transactions [tx-id ...] | check-in <owner> <vault> | claim <beneficiary> <vault> | deposit <owner> <vault> <asset-faucet> <amount>"),
+        Some("execute-deposit") if args.len() == 6 => {
+            execute_heirbeat_note("deposit", parse_id(&args[1])?, parse_id(&args[2])?, parse_id(&args[3])?, args[4].parse()?, args[5].parse()?).await
+        },
+        Some("execute-check-in") if args.len() == 5 => {
+            execute_heirbeat_note("check-in", parse_id(&args[1])?, parse_id(&args[2])?, parse_id(&args[3])?, 0, args[4].parse()?).await
+        },
+        Some("execute-claim") if args.len() == 5 => {
+            execute_heirbeat_note("claim", parse_id(&args[1])?, parse_id(&args[2])?, parse_id(&args[3])?, 0, args[4].parse()?).await
+        },
+        _ => bail!("usage: testnet_lifecycle preflight | create-faucet | verify-faucet <faucet> | deploy-faucet <faucet> | fund-faucet-deployment <faucet> <amount> | consume-faucet-bootstrap <faucet> <p2id-note-id> <sponsorship-note-id> <direct-fee-p2id-note-id> | mint-asset <faucet> <amount> <committed-native-fee-note-id> | status | inspect-faucet <faucet> | audit-asset <faucet> | audit-asset-db <faucet> <db-copy> | create-vault <owner> <beneficiary> <asset-faucet> <timeout> | verify-vault <vault> <owner> <beneficiary> <asset-faucet> | remove-bootstrap-p2id <vault> <owner> <beneficiary> <asset-faucet> | consume-config-notes <vault> <config-note-id> <sponsorship-note-id> | block-transactions <block> <account> | transactions [tx-id ...] | check-in <owner> <vault> | claim <beneficiary> <vault> | deposit <owner> <vault> <asset-faucet> <amount>"),
     }
 }

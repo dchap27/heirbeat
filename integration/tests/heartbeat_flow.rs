@@ -26,7 +26,10 @@ use miden_standards::{
         wallets::BasicWallet,
     },
     errors::standards::ERR_NOTE_SCRIPT_ALLOWLIST_NOTE_NOT_ALLOWED,
-    note::{FeeSponsorshipNote, NetworkAccountConfigNote, P2idNote},
+    note::{
+        AccountTargetNetworkNote, FeeSponsorshipNote, NetworkAccountConfigNote,
+        NetworkAccountTarget, NoteExecutionHint, P2idNote,
+    },
     testing::note::NoteBuilder,
     tx_script::{ExpirationTransactionScript, SendNotesTransactionScript},
 };
@@ -932,6 +935,36 @@ async fn deposit_recipient_is_enforced_independently_of_routing_tag() -> Result<
     // This vault supports the asset and script, but is not the committed recipient.
     h.reject(&deposit).await?;
     assert_eq!(balance(h.state()?), 0);
+    Ok(())
+}
+
+#[test]
+fn public_feature_note_has_canonical_network_account_target_attachment() -> Result<()> {
+    let h = Harness::new()?;
+    let mut builder = MockChain::builder();
+    let asset: Asset = supported(100);
+    let target = NetworkAccountTarget::new(h.vault, NoteExecutionHint::Always)?;
+    let note: Note = NoteBuilder::new(h.owner.id(), builder.rng_mut())
+        .tag(NoteTag::with_account_target(h.vault).into())
+        .script(h.deposit_script.clone())
+        .note_storage([h.vault.suffix(), h.vault.prefix().as_felt()])?
+        .add_assets([asset])
+        .attachment(target)
+        .build()?;
+
+    let network_note = AccountTargetNetworkNote::new(note.clone())?;
+    assert_eq!(network_note.target_account_id(), h.vault);
+    assert_eq!(network_note.execution_hint(), NoteExecutionHint::Always);
+    assert_eq!(note.recipient().script().root(), h.deposit_script.root());
+    assert_eq!(note.metadata().note_type(), NoteType::Public);
+    assert_eq!(
+        note.assets().iter().copied().collect::<Vec<_>>(),
+        vec![asset]
+    );
+    assert!(NetworkAccountNoteAllowlist::try_from(h.state()?.storage())?
+        .allowed_script_roots()
+        .contains(&note.recipient().script().root()));
+
     Ok(())
 }
 

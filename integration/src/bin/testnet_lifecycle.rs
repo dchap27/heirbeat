@@ -13,9 +13,9 @@ use miden_client::{
         AccountComponent, AccountId, AccountType, StorageSlotName,
     },
     builder::ClientBuilder,
-    keystore::FilesystemKeyStore,
+    keystore::{FilesystemKeyStore, Keystore},
     rpc::{Endpoint, GrpcClient, NodeRpcClient, VerifyingRpcClient},
-    store::{AccountStatus, TransactionFilter},
+    store::{AccountStatus, NoteFilter, TransactionFilter},
     transaction::TransactionRequestBuilder,
     transaction::TransactionStatus,
 };
@@ -23,6 +23,7 @@ use miden_client_sqlite_store::SqliteStore;
 use miden_mast_package::Package;
 use miden_protocol::{
     asset::{Asset, AssetAmount, FungibleAsset},
+    block::BlockNumber,
     note::{Note, NoteScript, NoteTag, NoteType},
     utils::serde::Deserializable,
     Felt, Word,
@@ -31,13 +32,18 @@ use miden_standards::{
     account::{
         access::AccessControl,
         auth::{
-            AuthNetworkAccount, NetworkAccount, NetworkAccountNoteAllowlist,
+            AuthNetworkAccount, AuthSingleSig, NetworkAccount, NetworkAccountNoteAllowlist,
             NetworkAccountTxScriptAllowlist,
         },
+        faucets::FungibleFaucet,
         fees::{BasicConstantFeePolicy, FeePolicyManager},
+        policies::{MintPolicy, TokenPolicyManager},
         wallets::BasicWallet,
     },
-    note::{FeeSponsorshipNote, NetworkAccountConfig, NetworkAccountConfigNote, P2idNote},
+    note::{
+        FeeSponsorshipNote, NetworkAccountConfig, NetworkAccountConfigNote, P2idNote,
+        P2idNoteStorage,
+    },
     testing::note::NoteBuilder,
     tx_script::ExpirationTransactionScript,
 };
@@ -70,13 +76,128 @@ fn owner_word(id: AccountId) -> Word {
 }
 
 async fn client() -> Result<miden_client::Client<FilesystemKeyStore>> {
-    let store = Arc::new(SqliteStore::new(state_dir().join("client.sqlite3")).await?);
-    let keys = FilesystemKeyStore::new(state_dir().join(".miden/keystore"))?;
+    client_from_paths(
+        state_dir().join("client.sqlite3"),
+        state_dir().join(".miden/keystore"),
+    )
+    .await
+}
+
+async fn client_from_paths(
+    db_path: PathBuf,
+    keystore_path: PathBuf,
+) -> Result<miden_client::Client<FilesystemKeyStore>> {
+    let store = Arc::new(SqliteStore::new(db_path).await?);
+    let keys = FilesystemKeyStore::new(keystore_path)?;
     Ok(ClientBuilder::for_testnet()
         .store(store)
         .authenticator(Arc::new(keys))
         .build()
         .await?)
+}
+
+async fn audit_asset(faucet_id: AccountId) -> Result<()> {
+    let mut client = client().await?;
+    let sync = client.sync_state().await?;
+    println!("synced_block={}", sync.block_num);
+    audit_asset_records(&client, faucet_id).await
+}
+
+async fn audit_asset_db(faucet_id: AccountId, db_path: PathBuf) -> Result<()> {
+    let client = client_from_paths(db_path, state_dir().join(".miden/keystore")).await?;
+    println!("store_mode=local_snapshot_no_sync");
+    audit_asset_records(&client, faucet_id).await
+}
+
+async fn audit_asset_records(
+    client: &miden_client::Client<FilesystemKeyStore>,
+    faucet_id: AccountId,
+) -> Result<()> {
+    let asset_id = FungibleAsset::new(faucet_id, 1)?.id();
+    let account_headers = client.get_account_headers().await?;
+    println!("tracked_account_count={}", account_headers.len());
+    for (header, status) in account_headers {
+        let Some(account) = client.get_account(header.id()).await? else {
+            continue;
+        };
+        let balance = account.vault().get_balance(asset_id)?;
+        println!(
+            "account_asset_balance account={} status={} amount={}",
+            header.id(),
+            status,
+            balance
+        );
+    }
+
+    let input_notes = client.get_input_notes(NoteFilter::All).await?;
+    let mut matching_inputs = 0;
+    for note in input_notes {
+        let matching = note
+            .assets()
+            .iter_fungible()
+            .any(|asset| asset.faucet_id() == faucet_id);
+        if matching {
+            matching_inputs += 1;
+            println!(
+                "input_note id={:?} amount_assets={:?} sender={:?} recipient_digest={} state={:?} created_at={:?} consumer={:?}",
+                note.id(),
+                note.assets(),
+                note.metadata().map(|metadata| metadata.sender()),
+                note.recipient(),
+                note.state(),
+                note.created_at(),
+                note.consumer_account()
+            );
+        }
+    }
+    println!("matching_input_note_count={matching_inputs}");
+
+    let output_notes = client.get_output_notes(NoteFilter::All).await?;
+    let mut matching_outputs = 0;
+    for note in output_notes {
+        let matching = note
+            .assets()
+            .iter_fungible()
+            .any(|asset| asset.faucet_id() == faucet_id);
+        if matching {
+            matching_outputs += 1;
+            println!(
+                "output_note id={} amount_assets={:?} sender={} recipient_digest={} script_root={:?} state={:?} expected_height={}",
+                note.id(),
+                note.assets(),
+                note.metadata().sender(),
+                note.recipient_digest(),
+                note.script_root(),
+                note.state(),
+                note.expected_height()
+            );
+        }
+    }
+    println!("matching_output_note_count={matching_outputs}");
+
+    let transactions = client.get_transactions(TransactionFilter::All).await?;
+    let mut matching_transactions = 0;
+    for tx in transactions {
+        let matching_outputs = tx.details.output_notes.iter().filter(|note| {
+            note.assets()
+                .iter_fungible()
+                .any(|asset| asset.faucet_id() == faucet_id)
+        });
+        for note in matching_outputs {
+            matching_transactions += 1;
+            println!(
+                "asset_transaction id={} account={} reference_block={} status={:?} output_note={} assets={:?}",
+                tx.id,
+                tx.details.account_id,
+                tx.details.block_num,
+                tx.status,
+                note.id(),
+                note.assets()
+            );
+        }
+    }
+    println!("matching_transaction_output_count={matching_transactions}");
+    Ok(())
 }
 
 fn parse_id(value: &str) -> Result<AccountId> {
@@ -91,6 +212,198 @@ async fn status() -> Result<()> {
     println!("block={}", header.block_num());
     println!("fee_faucet={}", fee.fee_faucet_id());
     println!("verification_base_fee={}", fee.verification_base_fee());
+    Ok(())
+}
+
+async fn inspect_inherited_faucet(faucet_id: AccountId) -> Result<()> {
+    let endpoint = Endpoint::testnet();
+    let rpc = VerifyingRpcClient::new(GrpcClient::new(&endpoint, 10_000));
+    let (header, _) = rpc.get_block_header_by_number(None, false).await?;
+    let account = rpc
+        .get_account_details(faucet_id)
+        .await?
+        .context("configured inherited faucet has no public on-chain account state")?;
+    let faucet = FungibleFaucet::try_from(&account)
+        .context("configured account does not expose the stable fungible faucet component")?;
+    let policy_root = account
+        .storage()
+        .get_item(TokenPolicyManager::active_mint_policy_slot())?;
+    let has_mint_signing_key = FilesystemKeyStore::new(state_dir().join(".miden/keystore"))?
+        .get_keys_for_account(&faucet_id)
+        .await
+        .map(|keys| !keys.is_empty())
+        .unwrap_or(false);
+    let network_style = NetworkAccount::new(account.clone()).is_ok();
+    let singlesig_auth_slot_present = account
+        .storage()
+        .get(AuthSingleSig::public_key_slot())
+        .is_some();
+    println!("sync_block={}", header.block_num());
+    println!("faucet_id={}", account.id());
+    println!("faucet_is_public={}", account.is_public());
+    println!("faucet_is_network_account={network_style}");
+    println!("single_signature_auth_slot_present={singlesig_auth_slot_present}");
+    println!("fungible_faucet_component=present");
+    println!("token_name={:?}", faucet.token_name());
+    println!("token_symbol={}", faucet.symbol());
+    println!("decimals={}", faucet.decimals());
+    println!("token_supply={}", faucet.token_supply());
+    println!("max_supply={}", faucet.max_supply());
+    println!("active_mint_policy_root={policy_root:?}");
+    println!(
+        "mint_policy_allow_all={}",
+        policy_root == MintPolicy::allow_all().root().as_word()
+    );
+    println!(
+        "mint_policy_owner_only={}",
+        policy_root == MintPolicy::owner_only().root().as_word()
+    );
+    println!("durable_signing_key_available={has_mint_signing_key}");
+
+    let history = rpc
+        .sync_transactions(BlockNumber::GENESIS, header.block_num(), vec![faucet_id])
+        .await?;
+    println!("faucet_transaction_count={}", history.len());
+    for transaction in history {
+        println!(
+            "faucet_transaction id={} block={} output_count={}",
+            transaction.transaction_header.id(),
+            transaction.block_num,
+            transaction.transaction_header.output_notes().len()
+        );
+        for output in transaction.transaction_header.output_notes() {
+            let id = output.id();
+            for fetched in rpc.get_notes_by_id(&[id]).await? {
+                match fetched {
+                    miden_client::rpc::domain::note::FetchedNote::Public(note, proof) => {
+                        let assets = note.assets().iter_fungible().collect::<Vec<_>>();
+                        let amount = assets
+                            .iter()
+                            .filter(|asset| asset.faucet_id() == faucet_id)
+                            .map(|asset| asset.amount().as_u64())
+                            .sum::<u64>();
+                        if amount > 0 {
+                            let nullifier = note.nullifier();
+                            let matching_nullifiers = rpc
+                                .sync_nullifiers(
+                                    &[nullifier.prefix()],
+                                    BlockNumber::GENESIS,
+                                    header.block_num(),
+                                )
+                                .await?;
+                            let consumed_at = matching_nullifiers
+                                .iter()
+                                .find(|update| update.nullifier == nullifier)
+                                .map(|update| update.block_num);
+                            let status = rpc
+                                .get_network_note_status(id)
+                                .await
+                                .map(|status| status.status.to_string())
+                                .unwrap_or_else(|error| format!("unavailable: {error}"));
+                            let recipient_account =
+                                if note.recipient().script().root() == P2idNote::script_root() {
+                                    P2idNoteStorage::try_from(note.recipient().storage().items())
+                                        .map(|storage| storage.target())
+                                        .context("invalid P2ID note storage")?
+                                } else {
+                                    bail!("100-unit faucet output is not a P2ID note")
+                                };
+                            println!(
+                                "faucet_asset_note id={} mint_transaction={} amount={} sender={} recipient_account={} recipient_digest={} script_root={} note_type={:?} committed_block={} nullifier_consumed_at={:?} network_status={}",
+                                id,
+                                transaction.transaction_header.id(),
+                                amount,
+                                note.metadata().sender(),
+                                recipient_account,
+                                note.recipient().digest(),
+                                note.recipient().script().root(),
+                                note.metadata().note_type(),
+                                proof.location().block_num(),
+                                consumed_at,
+                                status
+                            );
+
+                            let recipient_details =
+                                rpc.get_account_details(recipient_account).await?;
+                            let current_store_has_recipient_key =
+                                FilesystemKeyStore::new(state_dir().join(".miden/keystore"))?
+                                    .get_keys_for_account(&recipient_account)
+                                    .await
+                                    .map(|keys| !keys.is_empty())
+                                    .unwrap_or(false);
+                            let old_store_has_recipient_key = FilesystemKeyStore::new(
+                                PathBuf::from("/tmp/heirbeat-testnet-v016/.miden/keystore"),
+                            )?
+                            .get_keys_for_account(&recipient_account)
+                            .await
+                            .map(|keys| !keys.is_empty())
+                            .unwrap_or(false);
+                            println!(
+                                "mint_recipient_signing_key_current_store={} old_store={}",
+                                current_store_has_recipient_key, old_store_has_recipient_key
+                            );
+                            match recipient_details {
+                                Some(details) => {
+                                    println!(
+                                        "mint_recipient_account id={} public={} current_asset_balance={}",
+                                        recipient_account,
+                                        details.is_public(),
+                                        details.vault().get_balance(FungibleAsset::new(faucet_id, 1)?.id())?
+                                    );
+                                }
+                                None => println!(
+                                    "mint_recipient_account id={} exists=false",
+                                    recipient_account
+                                ),
+                            }
+
+                            let recipient_history = rpc
+                                .sync_transactions(
+                                    BlockNumber::GENESIS,
+                                    header.block_num(),
+                                    vec![recipient_account],
+                                )
+                                .await?;
+                            let consuming_transactions = recipient_history
+                                .iter()
+                                .filter(|record| {
+                                    record
+                                        .trusted_consumed_note_refs()
+                                        .any(|(_, note_id)| note_id == id)
+                                })
+                                .collect::<Vec<_>>();
+                            for record in &consuming_transactions {
+                                println!(
+                                    "mint_note_consumed_by transaction={} account={} block={}",
+                                    record.transaction_header.id(),
+                                    recipient_account,
+                                    record.block_num
+                                );
+                            }
+                            println!(
+                                "recipient_transactions={} matching_consumers={}",
+                                recipient_history.len(),
+                                consuming_transactions.len()
+                            );
+                        }
+                    }
+                    miden_client::rpc::domain::note::FetchedNote::Private(
+                        id,
+                        metadata,
+                        _,
+                        proof,
+                    ) => {
+                        println!(
+                            "faucet_private_output_note id={} sender={} committed_block={} asset_details=not_public",
+                            id,
+                            metadata.sender(),
+                            proof.location().block_num()
+                        );
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -835,6 +1148,13 @@ async fn main() -> Result<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     match args.first().map(String::as_str) {
         Some("status") => status().await,
+        Some("inspect-faucet") if args.len() == 2 => {
+            inspect_inherited_faucet(parse_id(&args[1])?).await
+        },
+        Some("audit-asset") if args.len() == 2 => audit_asset(parse_id(&args[1])?).await,
+        Some("audit-asset-db") if args.len() == 3 => {
+            audit_asset_db(parse_id(&args[1])?, PathBuf::from(&args[2])).await
+        },
         Some("create-vault") if args.len() == 5 => {
             create_vault(parse_id(&args[1])?, parse_id(&args[2])?, parse_id(&args[3])?, args[4].parse()?).await
         },
@@ -869,6 +1189,6 @@ async fn main() -> Result<()> {
         Some("deposit") if args.len() == 5 => {
             send_note("deposit", parse_id(&args[1])?, parse_id(&args[2])?, Some(parse_id(&args[3])?), args[4].parse()?).await
         },
-        _ => bail!("usage: testnet_lifecycle status | create-vault <owner> <beneficiary> <asset-faucet> <timeout> | verify-vault <vault> <owner> <beneficiary> <asset-faucet> | remove-bootstrap-p2id <vault> <owner> <beneficiary> <asset-faucet> | consume-config-notes <vault> <config-note-id> <sponsorship-note-id> | block-transactions <block> <account> | transactions [tx-id ...] | check-in <owner> <vault> | claim <beneficiary> <vault> | deposit <owner> <vault> <asset-faucet> <amount>"),
+        _ => bail!("usage: testnet_lifecycle status | inspect-faucet <faucet> | audit-asset <faucet> | audit-asset-db <faucet> <db-copy> | create-vault <owner> <beneficiary> <asset-faucet> <timeout> | verify-vault <vault> <owner> <beneficiary> <asset-faucet> | remove-bootstrap-p2id <vault> <owner> <beneficiary> <asset-faucet> | consume-config-notes <vault> <config-note-id> <sponsorship-note-id> | block-transactions <block> <account> | transactions [tx-id ...] | check-in <owner> <vault> | claim <beneficiary> <vault> | deposit <owner> <vault> <asset-faucet> <amount>"),
     }
 }

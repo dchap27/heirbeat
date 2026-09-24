@@ -1,68 +1,71 @@
 # Heirbeat
 
-Heirbeat's PUBLIC Miden Network Account architecture and owner-authorized heartbeat are proven in MockChain. This milestone adds beneficiary claim eligibility and a terminal claimed state. **No assets are deposited, moved, or paid out.** The project remains MockChain-only; production proofs, node scheduling, and public testnet deployment come later.
+Heirbeat implements a PUBLIC Miden Network Account with owner-authorized heartbeats, beneficiary inactivity claims, and fungible-asset custody. An eligible claim pays the **entire supported balance** to the configured beneficiary through a standard P2ID note. Runtime behavior is tested in MockChain; privacy, messages, frontend, production proofs, and public testnet deployment remain future milestones.
 
-## State and rules
+## State and custody
 
-Five named value slots under `heirbeat_vault::heirbeat_vault`:
+Six named value slots under `heirbeat_vault::heirbeat_vault`:
 
 | Slot | Encoding | Initial value |
 | --- | --- | --- |
-| `owner` | SDK AccountId word `[0, 0, suffix, prefix]` | Configured owner |
+| `owner` | AccountId word `[0, 0, suffix, prefix]` | Configured owner |
 | `beneficiary` | Same AccountId encoding | Configured beneficiary |
+| `asset_faucet` | Same AccountId encoding | One configured fungible faucet |
 | `last_check_in` | Felt in `[value, 0, 0, 0]` | `0` by default |
-| `timeout_blocks` | Felt containing a configured `u32` | Configured timeout |
-| `claimed` | Felt in `[value, 0, 0, 0]`: `0` false, `1` true | `0` |
+| `timeout_blocks` | Felt containing a validated `u32` | Configured timeout |
+| `claimed` | Felt: `0` false, `1` true | `0` |
 
-`deadline = last_check_in + timeout_blocks`. Eligibility is derived, never stored:
+Assets reside in Miden's native account vault, separately from component storage. Only the configured faucet's fungible asset **with callbacks disabled** is supported. Other faucets, callback-enabled assets, and NFTs are rejected by exact asset-key comparison. There is no inheritance amount or percentage allocation.
 
-```text
-ACTIVE -- reference block >= deadline --> ELIGIBLE -- beneficiary claim --> CLAIMED
-```
+`check_in()` requires `claimed == 0` and `active_note::get_sender()` equal to the stored owner. It records `tx::get_block_number()` and rejects older reference heights.
 
-`check_in()` requires `claimed == 0` and `active_note::get_sender()` equal to the stored owner. It records `tx::get_block_number()` and rejects older reference heights. Before a claim, a heartbeat can extend the deadline and restore ACTIVE status.
+`deadline = last_check_in + timeout_blocks`. Eligibility is derived, never stored. The block API means the **transaction reference block**, not the later commitment block. Both deadline operands are validated as `u32` and widened to `u64` before addition; the maximum sum is `8_589_934_590`, without wrapping. Initialization to zero remains temporary pending finalized vault-creation semantics.
 
-`claim()` requires the active note sender to equal the stored beneficiary, `claimed == 0`, and `tx::get_block_number() >= deadline`. It sets only `claimed = 1`; beneficiary and heartbeat state remain unchanged. CLAIMED is terminal: both subsequent claims and owner heartbeats fail. There are no owner/beneficiary update procedures or payout notes.
+`deposit()` requires an unclaimed vault and a nonempty note containing only the supported asset key. It adds assets without changing any protocol storage or counting as a heartbeat. Anyone can fund the vault. The deposit note enforces its committed recipient ID; an account-target tag alone is insufficient authorization.
 
-The block API returns the **transaction reference block**, not the later account-state commitment block. The contract validates both deadline operands as `u32`, then adds their canonical values as `u64`. The integration accessor uses the same bounds and widening. Maximum sum: `8_589_934_590`; a deadline above `u32::MAX` remains unreachable by a u32 reference block rather than wrapping. Default heartbeat initialization to zero remains temporary pending finalized vault-creation semantics.
+`claim()` requires the active note sender to equal the stored beneficiary, `claimed == 0`, reference block `>= deadline`, and a nonzero supported balance. It sets `claimed = 1`, removes the full balance, and creates one public standard P2ID note bound to the stored beneficiary. Amount and destination are not caller arguments. The payout uses the claim note's serial number and canonical beneficiary tag. Failed execution commits neither state nor asset changes.
 
-## Notes and sender binding
+CLAIMED is terminal: further claims, heartbeats, and deposits fail. A zero-balance claim fails without closing the vault. Rejected deposit notes remain unconsumed; rejection does not undo the sender's already-committed note creation or provide a refund path. There are no owner/beneficiary updates.
 
-`check-in-note` invokes `check_in()`; `claim-note` invokes `claim()`. Both carry no assets or note-storage arguments. Tests construct public notes with an account-target tag; this is routing metadata, not an additional recipient check in either contract.
+## Notes and authorization
 
-The vault uses `AccountType::Public` and `AuthNetworkAccount::with_allowed_notes` containing exactly those two script roots. `NetworkAccount::new` and the decoded allowlists are checked. The transaction-script allowlist is empty; wallet send scripts execute only on the sending wallets.
+The vault uses `AccountType::Public` and `AuthNetworkAccount::with_allowed_notes` containing **exactly** `check-in-note`, `claim-note`, and `deposit-note` script roots. `NetworkAccount::new` and decoded allowlists are checked. The transaction-script allowlist is empty. Payout P2ID notes are consumed by the beneficiary wallet, not by the vault.
 
-Owner, beneficiary, and attacker notes are produced by signature-authenticated wallet transactions and committed before consumption. Forged host metadata is constructible, but `AccountInterface::build_send_notes_script` rejects it with `InvalidSenderAccount`. Tests also bypass this host guard: an owner/beneficiary-built script executed by the attacker emits the attacker's actual ID because the kernel's `output_note::build_metadata` reads `account::get_id`. The forged note is never committed, and the actual attacker claim is rejected even when eligible. Fixture injection or unauthenticated-note simulation is not treated as sender-authenticity evidence.
+Check-in and claim notes carry no assets or storage arguments. Deposit notes carry assets and two recipient Felts `[suffix, prefix]`. Each invokes its corresponding compiled vault procedure through FPI.
+
+Notes originate in signature-authenticated wallet transactions and are committed before consumption. Forged host sender metadata is constructible, but `AccountInterface::build_send_notes_script` rejects it with `InvalidSenderAccount`. Bypassing that guard still emits the attacker's actual ID: kernel output-note metadata derives sender from `account::get_id`. Both owner and beneficiary spoofing paths are tested.
+
+The contract pins the canonical `miden-standards 0.15.3` P2ID script root in `contracts/heirbeat-vault/src/p2id.rs`; integration tests verify it against the standard library. Inspect/regenerate the constant with `cargo run -p integration --example p2id_root`. The transaction host resolves the standard payout script without expected-output-note hints.
 
 ## Build and verification
 
-Use the v0.15 toolchain binaries on `PATH`. Run builds from each contract directory because cargo-miden's top-level artifact path is relative to its working directory.
+Use the v0.15 toolchain binaries on `PATH`. Build from each contract directory because cargo-miden's top-level artifact path is relative to its working directory.
 
 ```bash
 export PATH="$HOME/.local/share/midenup/toolchains/0.15.0/bin:$PATH"
 (cd contracts/heirbeat-vault && cargo miden build --release)
 (cd contracts/check-in-note && cargo miden build --release)
 (cd contracts/claim-note && cargo miden build --release)
+(cd contracts/deposit-note && cargo miden build --release)
 cargo fmt --all -- --check
 cargo test --workspace -- --nocapture
 ```
 
-Artifacts are respectively `contracts/{heirbeat-vault,check-in-note,claim-note}/target/miden/release/{package-name}.masp`. Tests use `Package::read_from_bytes`, `AccountComponent::from_package` with named initialization data, and `NoteScript::from_package`. FPI dependencies remain in Miden project/WIT metadata, without a Rust account path dependency. The claim-note build in this environment reused the check-in-note Rust cache via `CARGO_TARGET_DIR`; its MASP still resides at the claim-note path above.
+Each artifact is `contracts/<package>/target/miden/release/<package>.masp`. Tests load packages using `Package::read_from_bytes`, attach the component through `AccountComponent::from_package` with named initialization data, and extract scripts with `NoteScript::from_package`. Account dependencies remain in Miden project/WIT metadata, without a normal Rust account path dependency. Claim/deposit builds here reuse the check-in-note Rust cache through `CARGO_TARGET_DIR`; MASP output remains at each package's path above.
 
-Nine runtime tests pass, none ignored:
+Runtime coverage includes:
 
-- Heartbeats persist at blocks `1` and `5`; deadline moves `100 → 101 → 105`.
-- Claim fails at reference block `5`, succeeds exactly at deadline `6`, persists at block `7`, and consumes the note.
-- Repeated claim and post-claim owner heartbeat fail without changing any account state.
-- Attacker and owner claims fail when eligible; failed notes remain unconsumed.
-- Heartbeat at `3` extends deadline `6 → 9`; claim fails at `7` and succeeds at `9`.
-- Deadline `1 + u32::MAX = 4_294_967_296` does not wrap into eligibility.
-- Owner/beneficiary sender spoofing and arbitrary note roots cannot authorize vault mutation.
+- Single deposit: vault `0 → 100 → 0`, beneficiary `0 → 100`; both deposit and payout consumed.
+- Deposits of `40 + 60` from different wallets pay the complete `100`.
+- Exact-deadline claims, repeated heartbeats, deadline extension `6 → 9`, and u32 overflow boundaries.
+- Early, wrong-claimant, owner, zero-balance, and repeated claims; terminal heartbeat/deposit rejection.
+- Sender spoofing, strict allowlist, incorrect deposit recipient, other faucet, and NFT rejection.
+- Atomic rollback when payout creation encounters malformed script advice and when a second claim aborts a transaction after its first payout was created. Retrying the valid claim succeeds.
 
-MockChain uses the real transaction executor with dummy proofs for block application. Tests reload committed state, compare execution/account commitments, verify note consumption, and check that successful claims neither change asset custody nor produce output notes.
+MockChain executes real transaction code with dummy proofs for block application. Tests use deterministic assets seeded into initial wallets, not a live faucet deployment. They reload committed account state, verify balances and commitments, inspect exact payout recipients/assets, and check consumption. An attacker cannot consume the beneficiary's P2ID payout.
 
 ## Versions and limitations
 
 Rust `nightly-2026-04-30`; Miden channel `0.15.0`; contract SDK `miden 0.13.1`; protocol/standards/tx/testing `0.15.3`; client/sqlite-store `0.15.2`; MAST package `0.23.4`; resolved VM crates `0.23.5`. Integration retains `cargo-miden 0.9.0` with resolved compiler dependencies `0.9.2`. No v0.16 upgrade.
 
-Rust assertion messages lower to the VM's generic `entered unreachable code` assertion, so negative tests check that error plus unchanged committed state; the error alone does not identify the failed contract condition. Existing `wide-arithmetic` and MAST HASHLESS/STRIPPED build diagnostics remain nonfatal. No new runtime blocker was observed.
+Rust assertions lower to the VM's generic `entered unreachable code` error. Negative tests therefore use otherwise-valid funded fixtures and verify unchanged committed state, rather than treating that error alone as proof of a specific failed condition. Existing wide-arithmetic and MAST HASHLESS/STRIPPED build diagnostics are nonfatal. No upstream runtime blocker is known; production proving and network scheduling remain unverified.

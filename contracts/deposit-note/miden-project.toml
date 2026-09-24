@@ -1,0 +1,15 @@
+[package]
+name = "deposit-note"
+version = "0.1.0"
+
+[lib]
+kind = "note"
+namespace = "miden:deposit-note/deposit@0.1.0"
+
+[dependencies]
+miden-core = "*"
+miden-protocol = "*"
+heirbeat-vault = { path = "../heirbeat-vault" }
+
+[package.metadata.miden.dependencies]
+heirbeat-vault = { wit = "../heirbeat-vault/target/generated-wit/" }

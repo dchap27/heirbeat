@@ -8,6 +8,7 @@ use miden_protocol::{
         auth::AuthScheme, component::InitStorageData, Account, AccountBuilder, AccountComponent,
         AccountId, AccountType, StorageSlotName,
     },
+    asset::{Asset, FungibleAsset, NonFungibleAsset},
     errors::MasmError,
     note::{Note, NoteScript, NoteScriptRoot, NoteTag, PartialNote},
     transaction::RawOutputNote,
@@ -20,9 +21,38 @@ use miden_standards::{
         interface::{AccountInterface, AccountInterfaceError, AccountInterfaceExt},
     },
     errors::standards::ERR_NOTE_SCRIPT_ALLOWLIST_NOTE_NOT_ALLOWED,
+    note::P2idNote,
     testing::note::NoteBuilder,
 };
 use miden_testing::{assert_transaction_executor_error, Auth, MockChain};
+
+#[path = "../../contracts/heirbeat-vault/src/p2id.rs"]
+mod pinned_p2id;
+
+fn supported(amount: u64) -> Asset {
+    FungibleAsset::mock(amount)
+}
+fn unsupported() -> Asset {
+    FungibleAsset::new(
+        miden_protocol::testing::account_id::ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1
+            .try_into()
+            .unwrap(),
+        50,
+    )
+    .unwrap()
+    .into()
+}
+fn balance(account: &Account) -> u64 {
+    account
+        .vault()
+        .get_balance(
+            FungibleAsset::new(FungibleAsset::mock_issuer(), 1)
+                .unwrap()
+                .vault_key(),
+        )
+        .unwrap()
+        .into()
+}
 
 const TIMEOUT: u32 = 100;
 
@@ -64,6 +94,7 @@ struct Harness {
     vault: AccountId,
     script: NoteScript,
     claim_script: NoteScript,
+    deposit_script: NoteScript,
 }
 
 impl Harness {
@@ -76,12 +107,28 @@ impl Harness {
         let auth = Auth::BasicAuth {
             auth_scheme: AuthScheme::Falcon512Poseidon2,
         };
-        let owner = builder.add_existing_wallet(auth.clone())?;
+        let owner = builder.add_existing_wallet_with_assets(auth.clone(), [supported(1000)])?;
         let beneficiary = builder.add_existing_wallet(auth.clone())?;
-        let attacker = builder.add_existing_wallet(auth)?;
+        let attacker = builder.add_existing_wallet_with_assets(
+            auth,
+            [
+                supported(1000),
+                unsupported(),
+                NonFungibleAsset::mock(&[1, 2, 3]),
+            ],
+        )?;
         let script = NoteScript::from_package(&package("check-in-note")?)?;
         let claim_script = NoteScript::from_package(&package("claim-note")?)?;
+        let deposit_script = NoteScript::from_package(&package("deposit-note")?)?;
+        assert_eq!(
+            P2idNote::script_root().as_word(),
+            Word::new(pinned_p2id::P2ID_ROOT.map(|value| Felt::new(value).unwrap()))
+        );
         let mut init = InitStorageData::default();
+        init.insert_value(
+            slot("asset_faucet").as_str(),
+            owner_word(FungibleAsset::mock_issuer()),
+        )?;
         init.insert_value(slot("owner").as_str(), owner_word(owner.id()))?;
         init.insert_value(slot("beneficiary").as_str(), owner_word(beneficiary.id()))?;
         init.insert_value(slot("claimed").as_str(), Word::default())?;
@@ -94,16 +141,20 @@ impl Harness {
             Word::new([Felt::from(timeout), Felt::ZERO, Felt::ZERO, Felt::ZERO]),
         )?;
         let component = AccountComponent::from_package(&package("heirbeat-vault")?, &init)?;
-        assert_eq!(component.storage_slots().len(), 5);
+        assert_eq!(component.storage_slots().len(), 6);
         let vault = AccountBuilder::new([42; 32])
             .account_type(AccountType::Public)
             .with_component(component)
             .with_auth_component(AuthNetworkAccount::with_allowed_notes(BTreeSet::from([
                 script.root(),
                 claim_script.root(),
+                deposit_script.root(),
             ]))?)
             .build_existing()?;
-        assert_network(&vault, [script.root(), claim_script.root()])?;
+        assert_network(
+            &vault,
+            [script.root(), claim_script.root(), deposit_script.root()],
+        )?;
         builder.add_account(vault.clone())?;
         let chain = builder.build()?;
         let h = Self {
@@ -114,6 +165,7 @@ impl Harness {
             vault: vault.id(),
             script,
             claim_script,
+            deposit_script,
         };
         assert_eq!(
             h.state()?.storage().get_item(&slot("owner"))?,
@@ -191,6 +243,8 @@ impl Harness {
     }
 
     async fn reject(&mut self, note: &Note) -> Result<()> {
+        let beneficiary_before = self.chain.committed_account(self.beneficiary.id())?.clone();
+        let notes_before = self.chain.committed_notes().len();
         let before = self.state()?.clone();
         let result = self
             .chain
@@ -205,15 +259,98 @@ impl Harness {
         self.chain.prove_next_block()?;
         assert_eq!(self.state()?, &before);
         assert!(!self.chain.is_note_consumed(&note.nullifier()));
+        assert_eq!(self.chain.committed_notes().len(), notes_before);
+        assert_eq!(
+            self.chain.committed_account(self.beneficiary.id())?,
+            &beneficiary_before
+        );
         Ok(())
     }
 
-    async fn claim(&mut self, note: &Note, reference: u32) -> Result<()> {
+    fn payout(&self, claim: &Note, amount: u64) -> Result<Note> {
+        let mut builder = MockChain::builder();
+        Ok(NoteBuilder::new(self.vault, builder.rng_mut())
+            .serial_number(claim.serial_num())
+            .tag(NoteTag::with_account_target(self.beneficiary.id()).into())
+            .script(P2idNote::script())
+            .note_storage([
+                self.beneficiary.id().suffix(),
+                self.beneficiary.id().prefix().as_felt(),
+            ])?
+            .add_assets([supported(amount)])
+            .build()?)
+    }
+
+    fn deposit_note(&self, sender: AccountId, assets: Vec<Asset>, serial: u32) -> Result<Note> {
+        let mut builder = MockChain::builder();
+        Ok(NoteBuilder::new(sender, builder.rng_mut())
+            .serial_number(Word::from([serial, 0, 0, 0]))
+            .tag(NoteTag::with_account_target(self.vault).into())
+            .script(self.deposit_script.clone())
+            .note_storage([self.vault.suffix(), self.vault.prefix().as_felt()])?
+            .add_assets(assets)
+            .build()?)
+    }
+
+    async fn fund(&mut self, sender: AccountId, amount: u64, serial: u32) -> Result<Note> {
+        let deposit = self.deposit_note(sender, vec![supported(amount)], serial)?;
+        let sender_before = balance(self.chain.committed_account(sender)?);
+        self.send(sender, &[deposit.clone()]).await?;
+        assert_eq!(
+            balance(self.chain.committed_account(sender)?),
+            sender_before - amount
+        );
+        let before = self.state()?.clone();
+        let executed = self
+            .chain
+            .build_tx_context(self.vault, &[deposit.id()], &[])?
+            .build()?
+            .execute()
+            .await?;
+        assert!(executed.output_notes().is_empty());
+        self.chain.add_pending_executed_transaction(&executed)?;
+        self.chain.prove_next_block()?;
+        assert_eq!(
+            self.state()?.storage(),
+            before.storage(),
+            "deposit cannot change protocol state"
+        );
+        assert_eq!(balance(self.state()?), balance(&before) + amount);
+        assert_eq!(
+            self.state()?.to_commitment(),
+            executed.final_account().to_commitment()
+        );
+        assert!(self.chain.is_note_consumed(&deposit.nullifier()));
+        Ok(deposit)
+    }
+
+    async fn receive_payout(&mut self, payout: &Note, amount: u64) -> Result<()> {
+        let before = balance(self.chain.committed_account(self.beneficiary.id())?);
+        let executed = self
+            .chain
+            .build_tx_context(self.beneficiary.id(), &[payout.id()], &[])?
+            .build()?
+            .execute()
+            .await?;
+        self.chain.add_pending_executed_transaction(&executed)?;
+        self.chain.prove_next_block()?;
+        assert_eq!(
+            balance(self.chain.committed_account(self.beneficiary.id())?),
+            before + amount
+        );
+        assert!(self.chain.is_note_consumed(&payout.nullifier()));
+        Ok(())
+    }
+
+    async fn claim(&mut self, note: &Note, reference: u32) -> Result<Note> {
         assert_eq!(
             self.chain.latest_block_header().block_num().as_u32(),
             reference
         );
         let before = self.state()?.clone();
+        let amount = balance(&before);
+        assert!(amount > 0);
+        let payout = self.payout(note, amount)?;
         let executed = self
             .chain
             .build_tx_context(self.vault, &[note.id()], &[])?
@@ -221,20 +358,29 @@ impl Harness {
             .execute()
             .await?;
         assert_eq!(executed.block_header().block_num().as_u32(), reference);
-        assert!(
-            executed.output_notes().is_empty(),
-            "claim must not create payouts"
+        assert_eq!(executed.output_notes().num_notes(), 1);
+        assert_eq!(
+            executed.output_notes().get_note(0),
+            &RawOutputNote::Full(payout.clone())
         );
         self.chain.add_pending_executed_transaction(&executed)?;
         self.chain.prove_next_block()?;
         assert_eq!(scalar(self.state()?, "claimed")?, 1);
-        for name in ["owner", "beneficiary", "last_check_in", "timeout_blocks"] {
+        for name in [
+            "owner",
+            "beneficiary",
+            "last_check_in",
+            "timeout_blocks",
+            "asset_faucet",
+        ] {
             assert_eq!(
                 self.state()?.storage().get_item(&slot(name))?,
                 before.storage().get_item(&slot(name))?
             );
         }
-        assert_eq!(self.state()?.vault(), before.vault());
+        assert_eq!(balance(self.state()?), 0);
+        assert!(self.state()?.vault().is_empty());
+        assert!(self.chain.is_note_committed(&payout.id()));
         assert_eq!(
             self.state()?.to_commitment(),
             executed.final_account().to_commitment()
@@ -242,9 +388,13 @@ impl Harness {
         assert!(self.chain.is_note_consumed(&note.nullifier()));
         assert_network(
             self.state()?,
-            [self.script.root(), self.claim_script.root()],
+            [
+                self.script.root(),
+                self.claim_script.root(),
+                self.deposit_script.root(),
+            ],
         )?;
-        Ok(())
+        Ok(payout)
     }
 
     async fn check_in(&mut self, note: &Note) -> Result<u32> {
@@ -266,13 +416,18 @@ impl Harness {
         assert!(self.chain.is_note_consumed(&note.nullifier()));
         assert_network(
             self.state()?,
-            [self.script.root(), self.claim_script.root()],
+            [
+                self.script.root(),
+                self.claim_script.root(),
+                self.deposit_script.root(),
+            ],
         )?;
         Ok(reference)
     }
 }
 
-fn assert_network(account: &Account, roots: [NoteScriptRoot; 2]) -> Result<()> {
+fn assert_network(account: &Account, roots: [NoteScriptRoot; 3]) -> Result<()> {
+    assert_eq!(BTreeSet::from(roots).len(), 3);
     assert!(account.is_public());
     assert_eq!(
         NetworkAccount::new(account.clone())?
@@ -423,6 +578,7 @@ async fn early_claim_then_exact_deadline_and_terminal_state() -> Result<()> {
         .await?;
     let heartbeat = h.note(h.owner.id(), 12)?;
     h.send(h.owner.id(), &[heartbeat.clone()]).await?;
+    h.fund(h.owner.id(), 100, 1001).await?;
     h.advance_to(5)?;
     h.reject(&first).await?; // deadline - 1; rejected note remains available
     assert_eq!(scalar(h.state()?, "claimed")?, 0);
@@ -442,6 +598,7 @@ async fn early_claim_then_exact_deadline_and_terminal_state() -> Result<()> {
 #[tokio::test]
 async fn wrong_claimant_and_owner_cannot_claim_when_eligible() -> Result<()> {
     let mut h = Harness::configured(6, 0)?;
+    h.fund(h.owner.id(), 100, 1003).await?;
     assert_ne!(h.owner.id(), h.beneficiary.id());
     assert_ne!(h.attacker.id(), h.beneficiary.id());
     let attacker = h.claim_note(h.attacker.id(), 20)?;
@@ -467,6 +624,7 @@ async fn heartbeat_postpones_claim_until_new_exact_deadline() -> Result<()> {
     assert_eq!(h.check_in(&heartbeat).await?, 3);
     let new_deadline = deadline(h.state()?)?;
     assert_eq!((old_deadline, new_deadline), (6, 9));
+    h.fund(h.owner.id(), 100, 1002).await?;
     h.advance_to(7)?; // strictly after old deadline, strictly before the new one
     h.reject(&claim).await?;
     assert_eq!(scalar(h.state()?, "claimed")?, 0);
@@ -479,6 +637,8 @@ async fn heartbeat_postpones_claim_until_new_exact_deadline() -> Result<()> {
 #[tokio::test]
 async fn deadline_above_u32_max_does_not_wrap_into_eligibility() -> Result<()> {
     let mut h = Harness::configured(u32::MAX, 1)?;
+    // A nonzero balance isolates the deadline check from the empty-vault guard.
+    h.fund(h.owner.id(), 100, 1004).await?;
     assert_eq!(deadline(h.state()?)?, 4_294_967_296);
     let claim = h.claim_note(h.beneficiary.id(), 40)?;
     h.send(h.beneficiary.id(), &[claim.clone()]).await?;
@@ -491,6 +651,7 @@ async fn deadline_above_u32_max_does_not_wrap_into_eligibility() -> Result<()> {
 #[tokio::test]
 async fn attacker_cannot_spoof_beneficiary_sender() -> Result<()> {
     let mut h = Harness::configured(6, 0)?;
+    h.fund(h.owner.id(), 100, 1005).await?;
     let forged = h.claim_note(h.beneficiary.id(), 50)?;
     assert_eq!(forged.metadata().sender(), h.beneficiary.id());
     let result = AccountInterface::from_account(&h.attacker)
@@ -526,5 +687,220 @@ async fn attacker_cannot_spoof_beneficiary_sender() -> Result<()> {
     h.advance_to(6)?;
     h.reject(&actual).await?; // Real committed output cannot authorize a beneficiary claim.
     assert_eq!(scalar(h.state()?, "claimed")?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn single_deposit_full_payout_and_terminal_asset_safety() -> Result<()> {
+    let mut h = Harness::configured(8, 0)?;
+    assert_eq!(balance(h.state()?), 0);
+    h.fund(h.owner.id(), 100, 100).await?;
+    assert_eq!(balance(h.state()?), 100);
+    assert_eq!(scalar(h.state()?, "claimed")?, 0);
+    let claim = h.claim_note(h.beneficiary.id(), 101)?;
+    h.send(h.beneficiary.id(), &[claim.clone()]).await?;
+    h.advance_to(8)?;
+    let payout = h.claim(&claim, 8).await?;
+    assert_eq!(payout.script().root(), P2idNote::script_root());
+    assert_eq!(
+        payout.assets().iter().copied().collect::<Vec<_>>(),
+        vec![supported(100)]
+    );
+    assert_eq!(
+        payout.storage().items(),
+        &[
+            h.beneficiary.id().suffix(),
+            h.beneficiary.id().prefix().as_felt()
+        ]
+    );
+    // Binding is enforced by P2ID itself, not just by its routing tag.
+    let result = h
+        .chain
+        .build_tx_context(h.attacker.id(), &[payout.id()], &[])?
+        .build()?
+        .execute()
+        .await;
+    assert_transaction_executor_error!(
+        result,
+        MasmError::from_static_str(
+            "P2ID's target account address and transaction address do not match"
+        )
+    );
+    assert!(!h.chain.is_note_consumed(&payout.nullifier()));
+    h.receive_payout(&payout, 100).await?;
+    assert_eq!(balance(h.chain.committed_account(h.beneficiary.id())?), 100);
+    let repeated = h.claim_note(h.beneficiary.id(), 102)?;
+    h.send(h.beneficiary.id(), &[repeated.clone()]).await?;
+    h.reject(&repeated).await?;
+    let heartbeat = h.note(h.owner.id(), 103)?;
+    h.send(h.owner.id(), &[heartbeat.clone()]).await?;
+    h.reject(&heartbeat).await?;
+    let deposit = h.deposit_note(h.owner.id(), vec![supported(25)], 104)?;
+    h.send(h.owner.id(), &[deposit.clone()]).await?;
+    h.reject(&deposit).await?;
+    assert_eq!(balance(h.state()?), 0);
+    assert_eq!(scalar(h.state()?, "claimed")?, 1);
+    assert_eq!(balance(h.chain.committed_account(h.beneficiary.id())?), 100);
+    assert_eq!(scalar(h.state()?, "last_check_in")?, 0);
+    println!("single deposit: vault 0 -> 100 -> 0; beneficiary 0 -> 100; terminal deposits/claims/heartbeat rejected");
+    Ok(())
+}
+
+#[tokio::test]
+async fn multiple_deposits_pay_combined_balance() -> Result<()> {
+    let mut h = Harness::configured(8, 0)?;
+    h.fund(h.owner.id(), 40, 110).await?;
+    assert_eq!(balance(h.state()?), 40);
+    h.fund(h.attacker.id(), 60, 111).await?; // permissionless funding
+    assert_eq!(balance(h.state()?), 100);
+    let claim = h.claim_note(h.beneficiary.id(), 112)?;
+    h.send(h.beneficiary.id(), &[claim.clone()]).await?;
+    h.advance_to(8)?;
+    let payout = h.claim(&claim, 8).await?;
+    h.receive_payout(&payout, 100).await?;
+    assert_eq!(balance(h.state()?), 0);
+    assert_eq!(balance(h.chain.committed_account(h.beneficiary.id())?), 100);
+    Ok(())
+}
+
+#[tokio::test]
+async fn early_and_wrong_claimants_cannot_move_assets() -> Result<()> {
+    let mut h = Harness::configured(8, 0)?;
+    h.fund(h.owner.id(), 100, 120).await?;
+    let early = h.claim_note(h.beneficiary.id(), 121)?;
+    h.send(h.beneficiary.id(), &[early.clone()]).await?;
+    assert!(h.chain.latest_block_header().block_num().as_u32() < 8);
+    h.reject(&early).await?;
+    let wrong = h.claim_note(h.attacker.id(), 122)?;
+    h.send(h.attacker.id(), &[wrong.clone()]).await?;
+    h.advance_to(8)?;
+    h.reject(&wrong).await?;
+    assert_eq!(balance(h.state()?), 100);
+    assert_eq!(scalar(h.state()?, "claimed")?, 0);
+    assert_eq!(balance(h.chain.committed_account(h.beneficiary.id())?), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn zero_balance_claim_does_not_close_vault() -> Result<()> {
+    let mut h = Harness::configured(2, 0)?;
+    let claim = h.claim_note(h.beneficiary.id(), 130)?;
+    h.send(h.beneficiary.id(), &[claim.clone()]).await?;
+    h.advance_to(2)?;
+    h.reject(&claim).await?;
+    assert_eq!(scalar(h.state()?, "claimed")?, 0);
+    assert_eq!(balance(h.state()?), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn other_faucet_and_nft_deposits_are_rejected_atomically() -> Result<()> {
+    let mut h = Harness::configured(8, 0)?;
+    for (serial, denied) in [
+        (140, unsupported()),
+        (141, NonFungibleAsset::mock(&[1, 2, 3])),
+    ] {
+        // Mixed deposit: even its supported portion must not be retained.
+        let note = h.deposit_note(h.attacker.id(), vec![supported(10), denied], serial)?;
+        h.send(h.attacker.id(), &[note.clone()]).await?;
+        h.reject(&note).await?;
+        assert!(h.state()?.vault().is_empty());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_transaction_after_payout_rolls_back_claim_and_assets() -> Result<()> {
+    let mut h = Harness::configured(8, 0)?;
+    h.fund(h.owner.id(), 100, 150).await?;
+    let first = h.claim_note(h.beneficiary.id(), 151)?;
+    let second = h.claim_note(h.beneficiary.id(), 152)?;
+    h.send(h.beneficiary.id(), &[first.clone(), second.clone()])
+        .await?;
+    h.advance_to(8)?;
+    let before = h.state()?.clone();
+    let notes_before = h.chain.committed_notes().len();
+    // Either ordering first creates a full payout, then the other claim fails the terminal guard.
+    let payout_a = h.payout(&first, 100)?;
+    let payout_b = h.payout(&second, 100)?;
+    let result = h
+        .chain
+        .build_tx_context(h.vault, &[first.id(), second.id()], &[])?
+        .extend_expected_output_notes(vec![
+            RawOutputNote::Full(payout_a.clone()),
+            RawOutputNote::Full(payout_b.clone()),
+        ])
+        .build()?
+        .execute()
+        .await;
+    assert_transaction_executor_error!(
+        result,
+        MasmError::from_static_str("entered unreachable code")
+    );
+    h.chain.prove_next_block()?;
+    assert_eq!(h.state()?, &before);
+    assert_eq!(scalar(h.state()?, "claimed")?, 0);
+    assert_eq!(balance(h.state()?), 100);
+    assert_eq!(h.chain.committed_notes().len(), notes_before);
+    assert!(!h.chain.is_note_committed(&payout_a.id()));
+    assert!(!h.chain.is_note_committed(&payout_b.id()));
+    assert!(!h.chain.is_note_consumed(&first.nullifier()));
+    assert!(!h.chain.is_note_consumed(&second.nullifier()));
+    // The same claim succeeds alone, proving it was not intrinsically invalid.
+    let payout = h.claim(&first, 9).await?;
+    h.receive_payout(&payout, 100).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn payout_creation_failure_preserves_claim_and_assets() -> Result<()> {
+    let mut h = Harness::configured(8, 0)?;
+    h.fund(h.owner.id(), 100, 160).await?;
+    let claim = h.claim_note(h.beneficiary.id(), 161)?;
+    h.send(h.beneficiary.id(), &[claim.clone()]).await?;
+    h.advance_to(8)?;
+    let before = h.state()?.clone();
+    let notes_before = h.chain.committed_notes().len();
+    // Corrupt the host's script witness: output creation fails after claimed is
+    // written and the asset is removed in the transaction's working state.
+    let error = h
+        .chain
+        .build_tx_context(h.vault, &[claim.id()], &[])?
+        .extend_advice_map([(P2idNote::script_root().as_word(), vec![Felt::ZERO])])
+        .build()?
+        .execute()
+        .await
+        .expect_err("malformed P2ID witness must fail");
+    assert!(
+        format!("{error:?}").contains("MalformedNoteScript"),
+        "{error:?}"
+    );
+    h.chain.prove_next_block()?;
+    assert_eq!(h.state()?, &before);
+    assert_eq!(balance(h.state()?), 100);
+    assert_eq!(scalar(h.state()?, "claimed")?, 0);
+    assert_eq!(h.chain.committed_notes().len(), notes_before);
+    assert!(!h.chain.is_note_consumed(&claim.nullifier()));
+    assert_eq!(balance(h.chain.committed_account(h.beneficiary.id())?), 0);
+    let payout = h.claim(&claim, 9).await?;
+    h.receive_payout(&payout, 100).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn deposit_recipient_is_enforced_independently_of_routing_tag() -> Result<()> {
+    let mut h = Harness::configured(8, 0)?;
+    let mut builder = MockChain::builder();
+    let deposit = NoteBuilder::new(h.owner.id(), builder.rng_mut())
+        .serial_number(Word::from([170u32, 0, 0, 0]))
+        .tag(NoteTag::with_account_target(h.vault).into())
+        .script(h.deposit_script.clone())
+        .note_storage([h.attacker.id().suffix(), h.attacker.id().prefix().as_felt()])?
+        .add_assets([supported(100)])
+        .build()?;
+    h.send(h.owner.id(), &[deposit.clone()]).await?;
+    // This vault supports the asset and script, but is not the committed recipient.
+    h.reject(&deposit).await?;
+    assert_eq!(balance(h.state()?), 0);
     Ok(())
 }

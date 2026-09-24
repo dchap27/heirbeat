@@ -1,13 +1,18 @@
 #![no_std]
 #![feature(alloc_error_handler)]
 
+extern crate alloc;
+
 use miden::*;
+mod p2id;
 
 #[component_storage]
 struct HeirbeatStorage {
     /// SDK AccountId word encoding: [0, 0, suffix, prefix].
     #[storage(description = "Configured owner account ID")]
     owner: StorageValue<Word>,
+    #[storage(description = "Only supported fungible faucet (callbacks disabled)")]
+    asset_faucet: StorageValue<Word>,
     #[storage(description = "Configured beneficiary account ID")]
     beneficiary: StorageValue<Word>,
     #[storage(description = "Terminal claim flag (0 or 1)")]
@@ -22,6 +27,7 @@ struct HeirbeatStorage {
 trait HeirbeatVault {
     fn check_in(&mut self);
     fn claim(&mut self);
+    fn deposit(&mut self);
     fn get_last_check_in(&self) -> Felt;
     fn get_timeout_blocks(&self) -> Felt;
 }
@@ -68,6 +74,46 @@ impl HeirbeatVault for HeirbeatStorage {
         );
         let deadline = last + timeout;
         assert!(current >= deadline, "Heirbeat: deadline not reached");
+        let faucet = self.asset_faucet.get();
+        let template =
+            asset::create_fungible_asset(AccountId::new(faucet[3], faucet[2]), felt!(1), false);
+        let balance = active_account::get_balance(template.key);
+        assert!(balance > felt!(0), "Heirbeat: empty vault");
+        let payout_asset = Asset::new(
+            template.key,
+            Word::new([balance, felt!(0), felt!(0), felt!(0)]),
+        );
         self.claimed.set(felt!(1));
+        native_account::remove_asset(payout_asset);
+        let script_root = Word::new(p2id::P2ID_ROOT.map(|value| Felt::new(value).unwrap()));
+        let recipient = note::build_recipient(
+            active_note::get_serial_number(),
+            script_root,
+            alloc::vec![beneficiary[2], beneficiary[3]],
+        );
+        // Canonical v0.15 account-target tag: top 14 prefix bits in a u32.
+        let tag = ((beneficiary[3].as_canonical_u64() >> 32) as u32) & 0xfffc_0000;
+        let output = output_note::create(
+            Tag::from(Felt::from_u32(tag)),
+            NoteType::from(felt!(1)),
+            recipient,
+        );
+        output_note::add_asset(payout_asset, output);
+    }
+    fn deposit(&mut self) {
+        assert!(self.claimed.get() == felt!(0), "Heirbeat: already claimed");
+        let faucet = self.asset_faucet.get();
+        let supported =
+            asset::create_fungible_asset(AccountId::new(faucet[3], faucet[2]), felt!(1), false);
+        let assets = active_note::get_assets();
+        assert!(!assets.is_empty(), "Heirbeat: empty deposit");
+        // Validate the entire note before adding any assets. This excludes NFTs, other
+        // faucets, and callback-enabled assets, not merely other asset amounts.
+        for asset in &assets {
+            assert!(asset.key == supported.key, "Heirbeat: unsupported asset");
+        }
+        for asset in assets {
+            native_account::add_asset(asset);
+        }
     }
 }

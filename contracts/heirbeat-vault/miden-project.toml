@@ -3,6 +3,7 @@ name = "heirbeat-vault"
 version = "0.1.0"
 
 [lib]
+path = "src/lib.rs"
 kind = "account-component"
 namespace = "miden:heirbeat-vault/heirbeat-vault@0.1.0"
 

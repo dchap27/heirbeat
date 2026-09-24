@@ -25,8 +25,11 @@ struct HeirbeatStorage {
 
 #[component]
 trait HeirbeatVault {
+    #[account_procedure]
     fn check_in(&mut self);
+    #[account_procedure]
     fn claim(&mut self);
+    #[account_procedure]
     fn deposit(&mut self);
     fn get_last_check_in(&self) -> Felt;
     fn get_timeout_blocks(&self) -> Felt;
@@ -48,7 +51,7 @@ impl HeirbeatVault for HeirbeatStorage {
             sender.prefix == owner[3] && sender.suffix == owner[2],
             "Heirbeat: sender is not owner"
         );
-        let current = tx::get_block_number();
+        let current = tx::get_block_number().as_felt();
         // A transaction with an older reference block must not move the heartbeat backwards.
         assert!(
             current >= self.last_check_in.get(),
@@ -64,7 +67,7 @@ impl HeirbeatVault for HeirbeatStorage {
             "Heirbeat: sender is not beneficiary"
         );
         assert!(self.claimed.get() == felt!(0), "Heirbeat: already claimed");
-        let current = tx::get_block_number().as_canonical_u64();
+        let current = u64::from(tx::get_block_number().as_u32());
         // Validate before adding: two u32 values fit in u64, with no field reduction.
         let last = self.last_check_in.get().as_canonical_u64();
         let timeout = self.timeout_blocks.get().as_canonical_u64();
@@ -75,13 +78,11 @@ impl HeirbeatVault for HeirbeatStorage {
         let deadline = last + timeout;
         assert!(current >= deadline, "Heirbeat: deadline not reached");
         let faucet = self.asset_faucet.get();
-        let template =
-            asset::create_fungible_asset(AccountId::new(faucet[3], faucet[2]), felt!(1), false);
-        let balance = active_account::get_balance(template.key);
-        assert!(balance > felt!(0), "Heirbeat: empty vault");
-        let payout_asset = Asset::new(
-            template.key,
-            Word::new([balance, felt!(0), felt!(0), felt!(0)]),
+        let asset_id = supported_asset_id(faucet);
+        let payout_asset = Asset::new(asset_id, active_account::get_asset(asset_id));
+        assert!(
+            payout_asset.amount() > AssetAmount::ZERO,
+            "Heirbeat: empty vault"
         );
         self.claimed.set(felt!(1));
         native_account::remove_asset(payout_asset);
@@ -103,17 +104,29 @@ impl HeirbeatVault for HeirbeatStorage {
     fn deposit(&mut self) {
         assert!(self.claimed.get() == felt!(0), "Heirbeat: already claimed");
         let faucet = self.asset_faucet.get();
-        let supported =
-            asset::create_fungible_asset(AccountId::new(faucet[3], faucet[2]), felt!(1), false);
-        let assets = active_note::get_assets();
+        let supported = supported_asset_id(faucet);
+        let assets = active_note::get_initial_assets();
         assert!(!assets.is_empty(), "Heirbeat: empty deposit");
         // Validate the entire note before adding any assets. This excludes NFTs, other
         // faucets, and callback-enabled assets, not merely other asset amounts.
         for asset in &assets {
-            assert!(asset.key == supported.key, "Heirbeat: unsupported asset");
+            assert!(asset.key == supported, "Heirbeat: unsupported asset");
         }
         for asset in assets {
             native_account::add_asset(asset);
         }
     }
+}
+
+/// v0.16 AssetId encoding: [class suffix, class prefix, faucet suffix with
+/// Fungible composition, faucet prefix]. The configured AccountId suffix has
+/// an unused low metadata byte, as required by the protocol.
+fn supported_asset_id(faucet: Word) -> Word {
+    let suffix = faucet[2].as_canonical_u64();
+    Word::new([
+        felt!(0),
+        felt!(0),
+        Felt::new((suffix & !0xff) | 1).unwrap(),
+        faucet[3],
+    ])
 }

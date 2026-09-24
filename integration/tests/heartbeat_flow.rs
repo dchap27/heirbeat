@@ -8,7 +8,7 @@ use miden_protocol::{
         auth::AuthScheme, component::InitStorageData, Account, AccountBuilder, AccountComponent,
         AccountId, AccountType, StorageSlotName,
     },
-    asset::{Asset, FungibleAsset, NonFungibleAsset},
+    asset::{Asset, AssetAmount, FungibleAsset, NonFungibleAsset},
     errors::MasmError,
     note::{Note, NoteScript, NoteScriptRoot, NoteTag, PartialNote},
     transaction::RawOutputNote,
@@ -17,12 +17,13 @@ use miden_protocol::{
 };
 use miden_standards::{
     account::{
-        auth::{AuthNetworkAccount, NetworkAccount, NetworkAccountTxScriptAllowlist},
-        interface::{AccountInterface, AccountInterfaceError, AccountInterfaceExt},
+        auth::{AuthNetworkAccount, NetworkAccountNoteAllowlist, NetworkAccountTxScriptAllowlist},
+        fees::{BasicConstantFeePolicy, FeePolicyManager},
     },
     errors::standards::ERR_NOTE_SCRIPT_ALLOWLIST_NOTE_NOT_ALLOWED,
     note::P2idNote,
     testing::note::NoteBuilder,
+    tx_script::SendNotesTransactionScript,
 };
 use miden_testing::{assert_transaction_executor_error, Auth, MockChain};
 
@@ -48,7 +49,7 @@ fn balance(account: &Account) -> u64 {
         .get_balance(
             FungibleAsset::new(FungibleAsset::mock_issuer(), 1)
                 .unwrap()
-                .vault_key(),
+                .id(),
         )
         .unwrap()
         .into()
@@ -142,14 +143,23 @@ impl Harness {
         )?;
         let component = AccountComponent::from_package(&package("heirbeat-vault")?, &init)?;
         assert_eq!(component.storage_slots().len(), 6);
+        let allowed = BTreeSet::from([script.root(), claim_script.root(), deposit_script.root()]);
+        // MockChain has zero verification fees. Explicit zero note fees preserve
+        // the exact inherited amounts without introducing a second asset class.
+        let mut policy = BasicConstantFeePolicy::new();
+        for root in &allowed {
+            policy = policy.with_fee(*root, AssetAmount::ZERO);
+        }
+        let fee_manager = FeePolicyManager::builder()
+            .active_fee_policy(policy.into())
+            .fee_faucet_id(miden_protocol::testing::account_id::ACCOUNT_ID_FEE_FAUCET.try_into()?)
+            .build();
         let vault = AccountBuilder::new([42; 32])
             .account_type(AccountType::Public)
             .with_component(component)
-            .with_auth_component(AuthNetworkAccount::with_allowed_notes(BTreeSet::from([
-                script.root(),
-                claim_script.root(),
-                deposit_script.root(),
-            ]))?)
+            // `new` adds configuration/sponsorship notes and an expiration script.
+            // `custom` preserves exactly our three roots and an empty tx allowlist.
+            .with_components(AuthNetworkAccount::custom(allowed, fee_manager)?)
             .build_existing()?;
         assert_network(
             &vault,
@@ -201,13 +211,12 @@ impl Harness {
     async fn send(&mut self, sender: AccountId, notes: &[Note]) -> Result<()> {
         let account = self.chain.committed_account(sender)?;
         let partial: Vec<_> = notes.iter().cloned().map(PartialNote::from).collect();
-        let script =
-            AccountInterface::from_account(account).build_send_notes_script(&partial, None)?;
+        let script = SendNotesTransactionScript::new(&account.code_interface(), &partial)?;
         let executed = self
             .chain
-            .build_tx_context(sender, &[], &[])?
-            .tx_script(script)
-            .extend_expected_output_notes(notes.iter().cloned().map(RawOutputNote::Full).collect())
+            .build_transaction(sender)
+            .send_notes_script(&script)
+            .expected_output_notes(notes.iter().cloned().map(RawOutputNote::Full).collect())
             .build()?
             .execute()
             .await?;
@@ -248,7 +257,8 @@ impl Harness {
         let before = self.state()?.clone();
         let result = self
             .chain
-            .build_tx_context(self.vault, &[note.id()], &[])?
+            .build_transaction(self.vault)
+            .authenticated_input_note(note.id())
             .build()?
             .execute()
             .await;
@@ -303,7 +313,8 @@ impl Harness {
         let before = self.state()?.clone();
         let executed = self
             .chain
-            .build_tx_context(self.vault, &[deposit.id()], &[])?
+            .build_transaction(self.vault)
+            .authenticated_input_note(deposit.id())
             .build()?
             .execute()
             .await?;
@@ -328,7 +339,8 @@ impl Harness {
         let before = balance(self.chain.committed_account(self.beneficiary.id())?);
         let executed = self
             .chain
-            .build_tx_context(self.beneficiary.id(), &[payout.id()], &[])?
+            .build_transaction(self.beneficiary.id())
+            .authenticated_input_note(payout.id())
             .build()?
             .execute()
             .await?;
@@ -353,7 +365,8 @@ impl Harness {
         let payout = self.payout(note, amount)?;
         let executed = self
             .chain
-            .build_tx_context(self.vault, &[note.id()], &[])?
+            .build_transaction(self.vault)
+            .authenticated_input_note(note.id())
             .build()?
             .execute()
             .await?;
@@ -401,7 +414,8 @@ impl Harness {
         let reference = self.chain.latest_block_header().block_num().as_u32();
         let executed = self
             .chain
-            .build_tx_context(self.vault, &[note.id()], &[])?
+            .build_transaction(self.vault)
+            .authenticated_input_note(note.id())
             .build()?
             .execute()
             .await?;
@@ -430,9 +444,7 @@ fn assert_network(account: &Account, roots: [NoteScriptRoot; 3]) -> Result<()> {
     assert_eq!(BTreeSet::from(roots).len(), 3);
     assert!(account.is_public());
     assert_eq!(
-        NetworkAccount::new(account.clone())?
-            .allowed_notes()
-            .allowed_script_roots(),
+        NetworkAccountNoteAllowlist::try_from(account.storage())?.allowed_script_roots(),
         &BTreeSet::from(roots)
     );
     assert!(
@@ -485,7 +497,8 @@ async fn wrong_owner_cannot_check_in() -> Result<()> {
     let before = h.state()?.clone();
     let result = h
         .chain
-        .build_tx_context(h.vault, &[note.id()], &[])?
+        .build_transaction(h.vault)
+        .authenticated_input_note(note.id())
         .build()?
         .execute()
         .await;
@@ -506,22 +519,26 @@ async fn attacker_cannot_spoof_owner_sender() -> Result<()> {
     // Untrusted host metadata can be constructed. The wallet send API must reject it.
     let forged = h.note(h.owner.id(), 4)?;
     assert_eq!(forged.metadata().sender(), h.owner.id());
-    let result = AccountInterface::from_account(&h.attacker)
-        .build_send_notes_script(&[PartialNote::from(forged.clone())], None);
+    let result = SendNotesTransactionScript::new(
+        &h.attacker.code_interface(),
+        &[PartialNote::from(forged.clone())],
+    );
     assert!(
-        matches!(result, Err(AccountInterfaceError::InvalidSenderAccount(id)) if id == h.owner.id()),
+        matches!(result, Err(miden_standards::tx_script::SendNotesTransactionScriptError::InvalidSenderAccount(id)) if id == h.owner.id()),
         "SECURITY BLOCKER: attacker send script accepted forged owner metadata"
     );
     // Bypass the host guard: build for the owner, then execute that same script as attacker.
     // The kernel must stamp the attacker's ID, regardless of the supplied host metadata.
-    let script = AccountInterface::from_account(&h.owner)
-        .build_send_notes_script(&[PartialNote::from(forged.clone())], None)?;
+    let script = SendNotesTransactionScript::new(
+        &h.owner.code_interface(),
+        &[PartialNote::from(forged.clone())],
+    )?;
     let actual = h.note(h.attacker.id(), 4)?;
     let executed = h
         .chain
-        .build_tx_context(h.attacker.id(), &[], &[])?
-        .tx_script(script)
-        .extend_expected_output_notes(vec![RawOutputNote::Full(actual.clone())])
+        .build_transaction(h.attacker.id())
+        .send_notes_script(&script)
+        .expected_output_note(RawOutputNote::Full(actual.clone()))
         .build()?
         .execute()
         .await?;
@@ -555,7 +572,8 @@ async fn unallowlisted_note_cannot_mutate_vault() -> Result<()> {
     let before = h.state()?.clone();
     let result = h
         .chain
-        .build_tx_context(h.vault, &[allowed.id(), denied.id()], &[])?
+        .build_transaction(h.vault)
+        .authenticated_input_notes([allowed.id(), denied.id()])
         .build()?
         .execute()
         .await;
@@ -654,21 +672,25 @@ async fn attacker_cannot_spoof_beneficiary_sender() -> Result<()> {
     h.fund(h.owner.id(), 100, 1005).await?;
     let forged = h.claim_note(h.beneficiary.id(), 50)?;
     assert_eq!(forged.metadata().sender(), h.beneficiary.id());
-    let result = AccountInterface::from_account(&h.attacker)
-        .build_send_notes_script(&[PartialNote::from(forged.clone())], None);
+    let result = SendNotesTransactionScript::new(
+        &h.attacker.code_interface(),
+        &[PartialNote::from(forged.clone())],
+    );
     assert!(
-        matches!(result, Err(AccountInterfaceError::InvalidSenderAccount(id)) if id == h.beneficiary.id()),
+        matches!(result, Err(miden_standards::tx_script::SendNotesTransactionScriptError::InvalidSenderAccount(id)) if id == h.beneficiary.id()),
         "SECURITY BLOCKER: attacker send script accepted forged beneficiary metadata"
     );
     // Deliberately bypass the host guard, then inspect the kernel-produced sender.
-    let script = AccountInterface::from_account(&h.beneficiary)
-        .build_send_notes_script(&[PartialNote::from(forged.clone())], None)?;
+    let script = SendNotesTransactionScript::new(
+        &h.beneficiary.code_interface(),
+        &[PartialNote::from(forged.clone())],
+    )?;
     let actual = h.claim_note(h.attacker.id(), 50)?;
     let executed = h
         .chain
-        .build_tx_context(h.attacker.id(), &[], &[])?
-        .tx_script(script)
-        .extend_expected_output_notes(vec![RawOutputNote::Full(actual.clone())])
+        .build_transaction(h.attacker.id())
+        .send_notes_script(&script)
+        .expected_output_note(RawOutputNote::Full(actual.clone()))
         .build()?
         .execute()
         .await?;
@@ -716,7 +738,8 @@ async fn single_deposit_full_payout_and_terminal_asset_safety() -> Result<()> {
     // Binding is enforced by P2ID itself, not just by its routing tag.
     let result = h
         .chain
-        .build_tx_context(h.attacker.id(), &[payout.id()], &[])?
+        .build_transaction(h.attacker.id())
+        .authenticated_input_note(payout.id())
         .build()?
         .execute()
         .await;
@@ -825,8 +848,9 @@ async fn failed_transaction_after_payout_rolls_back_claim_and_assets() -> Result
     let payout_b = h.payout(&second, 100)?;
     let result = h
         .chain
-        .build_tx_context(h.vault, &[first.id(), second.id()], &[])?
-        .extend_expected_output_notes(vec![
+        .build_transaction(h.vault)
+        .authenticated_input_notes([first.id(), second.id()])
+        .expected_output_notes(vec![
             RawOutputNote::Full(payout_a.clone()),
             RawOutputNote::Full(payout_b.clone()),
         ])
@@ -865,8 +889,9 @@ async fn payout_creation_failure_preserves_claim_and_assets() -> Result<()> {
     // written and the asset is removed in the transaction's working state.
     let error = h
         .chain
-        .build_tx_context(h.vault, &[claim.id()], &[])?
-        .extend_advice_map([(P2idNote::script_root().as_word(), vec![Felt::ZERO])])
+        .build_transaction(h.vault)
+        .authenticated_input_note(claim.id())
+        .add_advice_map_entry(P2idNote::script_root().as_word(), vec![Felt::ZERO])
         .build()?
         .execute()
         .await

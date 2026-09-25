@@ -6,6 +6,8 @@ use miden_mast_package::Package;
 use miden_protocol::utils::serde::Deserializable;
 use std::path::Path;
 
+pub mod testnet;
+
 pub fn build_contract(path: &Path) -> Result<Package> {
     // Use the project-pinned toolchain; linking cargo-miden 0.10 as a Rust library
     // would pull its release-candidate protocol dependencies into this runtime.

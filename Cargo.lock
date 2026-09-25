@@ -2003,6 +2003,8 @@ dependencies = [
  "miden-testing",
  "miden-tx",
  "rand 0.10.2",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

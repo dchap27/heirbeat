@@ -57,6 +57,39 @@ cargo fmt --all -- --check
 cargo test --workspace -- --nocapture
 ```
 
+## Testnet lifecycle CLI
+
+The `integration` binary operates on the Miden v0.16 public testnet and stores
+non-secret settings and public transaction evidence in
+`.local/testnet-v016/heirbeat.json`. Account signing keys remain in the Miden
+keystore under `.local/testnet-v016/.miden/keystore`; this directory is ignored
+by Git. Import/track the owner and beneficiary accounts and ensure the owner
+has native fee liquidity before using mutating commands, then configure their
+public IDs:
+
+```bash
+cargo run -p integration --bin testnet_lifecycle -- configure \
+  --owner <OWNER_ID> --beneficiary <BENEFICIARY_ID>
+cargo run -p integration --bin testnet_lifecycle -- status --json
+cargo run -p integration --bin testnet_lifecycle -- create-faucet --yes
+cargo run -p integration --bin testnet_lifecycle -- deploy-vault --timeout 10 --yes
+cargo run -p integration --bin testnet_lifecycle -- mint --amount 100 --yes
+cargo run -p integration --bin testnet_lifecycle -- deposit --amount 100 --yes
+cargo run -p integration --bin testnet_lifecycle -- heartbeat --yes
+cargo run -p integration --bin testnet_lifecycle -- status
+cargo run -p integration --bin testnet_lifecycle -- claim --yes
+cargo run -p integration --bin testnet_lifecycle -- consume --yes
+cargo run -p integration --bin testnet_lifecycle -- verify
+```
+
+Live mutations require `--yes`; `deposit`, `heartbeat`, and `claim` also accept
+`--dry-run` to build and validate the notes and target attachment without
+submitting. Polling is bounded and configurable with `--poll-seconds` and
+`--timeout-seconds`. The CLI never submits a Network Account transaction: it
+submits the normal wallet transaction with the feature note and paired fee
+sponsorship, then waits for NTX-builder execution. Use `fund-fees` for normal
+wallet P2ID fee funding and sponsorship only for Network Account execution.
+
 Each artifact is `contracts/<package>/target/miden/release/<package>.masp`. Tests load packages using `Package::read_from_bytes`, attach the component through `AccountComponent::from_package` with named initialization data, and extract scripts with `NoteScript::from_package`. Account dependencies remain in Miden project/WIT metadata, without a normal Rust account path dependency. Claim/deposit builds here reuse the check-in-note Rust cache through `CARGO_TARGET_DIR`; MASP output remains at each package's path above.
 
 Runtime coverage includes:

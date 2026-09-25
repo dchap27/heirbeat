@@ -2434,6 +2434,259 @@ async fn submit_targeted_check_in_funding(owner: AccountId, vault_id: AccountId)
     Ok(())
 }
 
+async fn submit_targeted_claim_funding(beneficiary: AccountId, vault_id: AccountId) -> Result<()> {
+    const SPONSORSHIP_AMOUNT: u64 = 150;
+    let mut client = client().await?;
+    let sync = client.sync_state().await?;
+    let vault = client
+        .get_account(vault_id)
+        .await?
+        .context("Heirbeat vault is not tracked in the durable store")?;
+    let network_account = NetworkAccount::new(vault.clone())?;
+    let owner = parse_id("0xa61714a99ec7619109e397cbac32cd")?;
+    let asset_faucet = parse_id("0x4020542183b9643120d0192be38793")?;
+    let owner_word_at = |name: &str| -> Result<Word> {
+        Ok(vault
+            .storage()
+            .get_item(&StorageSlotName::new(slot(name))?)?)
+    };
+    ensure!(
+        owner_word_at("owner")? == owner_word(owner),
+        "vault owner changed"
+    );
+    ensure!(
+        owner_word_at("beneficiary")? == owner_word(beneficiary),
+        "claim sender is not the configured beneficiary"
+    );
+    ensure!(
+        owner_word_at("asset_faucet")? == owner_word(asset_faucet),
+        "vault inherited faucet changed"
+    );
+    ensure!(
+        owner_word_at("claimed")? == Word::default(),
+        "vault is already claimed"
+    );
+    let last_check_in = owner_word_at("last_check_in")?[0].as_canonical_u64();
+    let timeout = owner_word_at("timeout_blocks")?[0].as_canonical_u64();
+    ensure!(timeout == 10, "vault timeout is not 10");
+    let deadline = last_check_in
+        .checked_add(timeout)
+        .context("deadline arithmetic overflow")?;
+    ensure!(
+        u64::from(sync.block_num.as_u32()) >= deadline,
+        "claim is not yet eligible: synced block {} < deadline {deadline}",
+        sync.block_num
+    );
+    let inherited_asset_id = FungibleAsset::new(asset_faucet, 1)?.id();
+    ensure!(
+        vault.vault().get_balance(inherited_asset_id)? == AssetAmount::from(100u32),
+        "vault inherited balance is not exactly 100"
+    );
+
+    let script = NoteScript::from_package(&package("claim-note")?)?;
+    ensure!(
+        network_account
+            .allowed_notes()
+            .allowed_script_roots()
+            .contains(&script.root()),
+        "claim root is not allowlisted"
+    );
+    ensure!(
+        !network_account
+            .allowed_notes()
+            .allowed_script_roots()
+            .contains(&P2idNote::script_root()),
+        "P2ID must remain absent from the vault input-note allowlist"
+    );
+    let target = NetworkAccountTarget::new(vault_id, NoteExecutionHint::Always)?;
+    let mut serial_rng = rng();
+    let claim_note: Note = NoteBuilder::new(beneficiary, rng())
+        .tag(NoteTag::with_account_target(vault_id).into())
+        .note_type(NoteType::Public)
+        .script(script.clone())
+        .attachment(target)
+        .build()?;
+    let network_note = miden_standards::note::AccountTargetNetworkNote::new(claim_note.clone())?;
+    ensure!(
+        network_note.target_account_id() == vault_id,
+        "claim targets the wrong account"
+    );
+    ensure!(
+        claim_note.assets().is_empty(),
+        "claim note must carry no assets"
+    );
+
+    let fee_faucet = parse_id(FEE_FAUCET)?;
+    let sponsorship_note: Note = FeeSponsorshipNote::builder()
+        .sender(beneficiary)
+        .target_account(vault_id)
+        .feature_note_id(claim_note.id())
+        .asset(FungibleAsset::new(fee_faucet, SPONSORSHIP_AMOUNT)?)
+        .generate_serial_number(&mut serial_rng)
+        .build()?
+        .into();
+    let sponsorship_storage =
+        FeeSponsorshipNoteStorage::try_from(sponsorship_note.recipient().storage().items())?;
+    ensure!(
+        sponsorship_storage.feature_note_id() == claim_note.id(),
+        "sponsorship is not paired to the claim note"
+    );
+    let beneficiary_account = client
+        .get_account(beneficiary)
+        .await?
+        .context("beneficiary is not tracked in the durable client store")?;
+    let native_balance = beneficiary_account
+        .vault()
+        .get_balance(FungibleAsset::new(fee_faucet, 1)?.id())?;
+    ensure!(
+        native_balance >= AssetAmount::from((SPONSORSHIP_AMOUNT + 7) as u32),
+        "beneficiary needs a native fee top-up before creating the claim sponsorship"
+    );
+    let keys = FilesystemKeyStore::new(state_dir().join(".miden/keystore"))?;
+    ensure!(
+        !keys.get_keys_for_account(&beneficiary).await?.is_empty(),
+        "beneficiary signer is unavailable"
+    );
+
+    let beneficiary_transaction = client
+        .submit_new_transaction(
+            beneficiary,
+            TransactionRequestBuilder::new()
+                .own_output_notes([claim_note.clone(), sponsorship_note.clone()])
+                .expected_ntx_scripts(vec![script, FeeSponsorshipNote::script()])
+                .build()?,
+        )
+        .await?;
+    let funding_block = committed_block(&mut client, beneficiary_transaction).await?;
+    println!("starting_sync_block={}", sync.block_num);
+    println!("eligible_reference_block={}", sync.block_num);
+    println!("deadline={deadline}");
+    println!("owner={owner}");
+    println!("beneficiary={beneficiary}");
+    println!("vault={vault_id}");
+    println!("beneficiary_funding_transaction_id={beneficiary_transaction}");
+    println!("beneficiary_funding_committed_block={funding_block}");
+    println!("claim_note_id={}", claim_note.id());
+    println!(
+        "claim_script_root={}",
+        claim_note.recipient().script().root()
+    );
+    println!("claim_target_attachment={:?}", network_note.target());
+    println!("claim_note_is_public=true");
+    println!("claim_note_assets_empty=true");
+    println!("sponsorship_note_id={}", sponsorship_note.id());
+    println!("sponsorship_amount={SPONSORSHIP_AMOUNT}");
+    println!(
+        "sponsorship_feature_note_id={}",
+        sponsorship_storage.feature_note_id()
+    );
+    println!("network_account_transaction_submitted=false");
+    Ok(())
+}
+
+async fn inspect_public_payout(note_id: miden_protocol::note::NoteId) -> Result<()> {
+    let rpc = VerifyingRpcClient::new(GrpcClient::new(&Endpoint::testnet(), 10_000));
+    let (header, _) = rpc.get_block_header_by_number(None, false).await?;
+    let fetched = rpc.get_notes_by_id(&[note_id]).await?;
+    let (note, proof) = fetched
+        .into_iter()
+        .find_map(|fetched| match fetched {
+            miden_client::rpc::domain::note::FetchedNote::Public(note, proof) => {
+                Some((note, proof))
+            }
+            _ => None,
+        })
+        .context("payout note is not publicly discoverable")?;
+    ensure!(
+        note.recipient().script().root() == P2idNote::script_root(),
+        "payout note does not use canonical P2ID"
+    );
+    let storage = P2idNoteStorage::try_from(note.recipient().storage().items())?;
+    ensure!(
+        storage.target() == parse_id("0x4181277bcf64381105ee61baadb5bc")?,
+        "P2ID target is not the configured beneficiary"
+    );
+    let assets = note.assets().iter_fungible().collect::<Vec<_>>();
+    ensure!(
+        assets.len() == 1,
+        "payout must contain exactly one fungible asset"
+    );
+    ensure!(
+        assets[0].faucet_id() == parse_id("0x4020542183b9643120d0192be38793")?
+            && assets[0].amount() == AssetAmount::from(100u32),
+        "P2ID does not contain exactly 100 HBTESTV"
+    );
+    println!("public_chain_block={}", header.block_num());
+    println!("payout_note_id={note_id}");
+    println!("payout_committed_block={}", proof.location().block_num());
+    println!("payout_nullifier={}", note.nullifier());
+    println!("payout_script_root={}", note.recipient().script().root());
+    println!("payout_recipient={}", storage.target());
+    println!("payout_assets={:?}", note.assets());
+    Ok(())
+}
+
+async fn consume_public_payout(
+    beneficiary: AccountId,
+    note_id: miden_protocol::note::NoteId,
+) -> Result<()> {
+    let mut client = client().await?;
+    let sync = client.sync_state().await?;
+    let note = tracked_note_for_consumption(&client, note_id).await?;
+    let fee_asset_id = FungibleAsset::new(parse_id(FEE_FAUCET)?, 1)?.id();
+    let inherited_asset_id =
+        FungibleAsset::new(parse_id("0x4020542183b9643120d0192be38793")?, 1)?.id();
+    let before = client
+        .get_account(beneficiary)
+        .await?
+        .context("beneficiary account is not tracked")?;
+    let native_before = before.vault().get_balance(fee_asset_id)?;
+    let inherited_before = before.vault().get_balance(inherited_asset_id)?;
+    let txid = client
+        .submit_new_transaction(
+            beneficiary,
+            TransactionRequestBuilder::new()
+                .input_notes([(note, None)])
+                .expected_ntx_scripts(vec![P2idNote::script()])
+                .build()?,
+        )
+        .await?;
+    let committed = committed_block(&mut client, txid).await?;
+    let after = client
+        .get_account(beneficiary)
+        .await?
+        .context("beneficiary account disappeared after payout consumption")?;
+    let inherited_after = after.vault().get_balance(inherited_asset_id)?;
+    let consumed = client
+        .get_input_note(note_id)
+        .await?
+        .context("payout note record is missing after consumption")?;
+    ensure!(
+        consumed.consumer_account() == Some(beneficiary),
+        "payout was not consumed by the configured beneficiary"
+    );
+    ensure!(
+        inherited_after.as_u64() == inherited_before.as_u64() + 100,
+        "beneficiary balance did not increase by exactly 100"
+    );
+    println!("beneficiary_starting_sync_block={}", sync.block_num);
+    println!("payout_consumption_transaction_id={txid}");
+    println!("payout_consumption_committed_block={committed}");
+    println!("payout_note_id={note_id}");
+    println!(
+        "payout_nullifier_consumed_by={:?}",
+        consumed.consumer_account()
+    );
+    println!("beneficiary_HBTESTV_before={inherited_before}");
+    println!("beneficiary_HBTESTV_after={inherited_after}");
+    println!("beneficiary_native_fee_before={native_before}");
+    println!(
+        "beneficiary_native_fee_after={}",
+        after.vault().get_balance(fee_asset_id)?
+    );
+    Ok(())
+}
+
 fn rng() -> impl miden_protocol::crypto::rand::FeltRng {
     let mut os_rng = rand::rng();
     miden_protocol::crypto::rand::RandomCoin::new(Word::new([
@@ -2740,6 +2993,19 @@ async fn main() -> Result<()> {
         Some("submit-targeted-check-in") if args.len() == 3 => {
             submit_targeted_check_in_funding(parse_id(&args[1])?, parse_id(&args[2])?).await
         }
+        Some("submit-targeted-claim") if args.len() == 3 => {
+            submit_targeted_claim_funding(parse_id(&args[1])?, parse_id(&args[2])?).await
+        },
+        Some("inspect-payout") if args.len() == 2 => {
+            inspect_public_payout(miden_protocol::note::NoteId::try_from_hex(&args[1])?).await
+        },
+        Some("consume-payout") if args.len() == 3 => {
+            consume_public_payout(
+                parse_id(&args[1])?,
+                miden_protocol::note::NoteId::try_from_hex(&args[2])?,
+            )
+            .await
+        },
         Some(stage @ ("check-in" | "claim")) if args.len() == 3 => {
             send_note(stage, parse_id(&args[1])?, parse_id(&args[2])?, None, 0).await
         },

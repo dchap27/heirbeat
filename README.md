@@ -1,6 +1,12 @@
 # Heirbeat
 
-Heirbeat implements a PUBLIC Miden Network Account with owner-authorized heartbeats, beneficiary inactivity claims, and fungible-asset custody. An eligible claim pays the **entire supported balance** to the configured beneficiary through a standard P2ID note. Runtime behavior is tested in MockChain; privacy, messages, frontend, production proofs, and public testnet deployment remain future milestones.
+Heirbeat implements a PUBLIC Miden Network Account with owner-authorized heartbeats, beneficiary inactivity claims, and fungible-asset custody. An eligible claim pays the **entire supported balance** to the configured beneficiary through a standard P2ID note. MockChain regressions and a complete public-testnet lifecycle have been exercised; privacy, messages, and frontend remain future milestones.
+
+## Public Testnet Status
+
+The live lifecycle completed on the Miden v0.16 public testnet (`https://rpc.testnet.miden.io`) using the NTX builder's automatic execution path. The Heirbeat Network Account `0x39fcc854fe715ad1446afb9859df04` holds state for owner `0xa61714a99ec7619109e397cbac32cd` and beneficiary `0x4181277bcf64381105ee61baadb5bc`; inherited faucet `0x4020542183b9643120d0192be38793` is HBTESTV. A 100-unit deposit was followed by heartbeat at reference block `450117`, eligibility at block `450127`, beneficiary claim, full-balance P2ID payout, and beneficiary consumption.
+
+Public evidence: deposit funding transaction `0xcc74cf283012db4bcb2d2c8a51ca65aa98799b95fe2cb933d060c30730f5fa9c`, deposit note `0x6c55c4c1ee74b846a1cb468b2d1cc37790ed8cc4c189d29a7b8600c72eb74beb`; heartbeat funding transaction `0xc8f5ac51141b85884bde037ab6e82fc126b081b91ea9f98045fcfd2d34893bdf`, note `0x92da7ad5fad0defb64bf847dc49f7320b443bbcbeb1d4f71a9fadc318254f680`; claim funding transaction `0x63c579af38e75eaa466bf38437d724b370a18a3396564d6f6e3c52ad8627fb68`, claim note `0x9a432906999582825c1e15d69f53312a6f8e84c8787bb26029ffcba850cc852d`, vault claim transaction `0xd3fac87bb0cbce14fd4d09d08425d3e34173f629571f21b043f35c765041c478`; payout note `0xf5d28de2a49084c4d7126b3701e0024fc4747d0b5e63ef79e05cc8e6385294e0`, consumed by transaction `0xdc525ae744a532051ca3fefe78a348db875347d3cf2d57204c6929917bac86eb`. Final HBTESTV accounting is owner `10` + beneficiary `100` + vault `0` + the untouched malformed committed note `100` = faucet supply `210`. This is an early testnet protocol run, not a production deployment. No secrets are included.
 
 ## State and custody
 
@@ -29,20 +35,20 @@ CLAIMED is terminal: further claims, heartbeats, and deposits fail. A zero-balan
 
 ## Notes and authorization
 
-The vault uses `AccountType::Public` and `AuthNetworkAccount::with_allowed_notes` containing **exactly** `check-in-note`, `claim-note`, and `deposit-note` script roots. `NetworkAccount::new` and decoded allowlists are checked. The transaction-script allowlist is empty. Payout P2ID notes are consumed by the beneficiary wallet, not by the vault.
+The vault uses `AccountType::Public` and `AuthNetworkAccount::with_allowed_notes` containing the three Heirbeat roots: `check-in-note`, `claim-note`, and `deposit-note`. The live v0.16 Network Account additionally retains the required `NetworkAccountConfig` and `FeeSponsorship` roots; its P2ID input root is absent. Its transaction-script allowlist contains only the canonical expiration root. Payout P2ID notes are consumed by the beneficiary wallet, not by the vault.
 
 Check-in and claim notes carry no assets or storage arguments. Deposit notes carry assets and two recipient Felts `[suffix, prefix]`. Each invokes its corresponding compiled vault procedure through FPI.
 
 Notes originate in signature-authenticated wallet transactions and are committed before consumption. Forged host sender metadata is constructible, but `AccountInterface::build_send_notes_script` rejects it with `InvalidSenderAccount`. Bypassing that guard still emits the attacker's actual ID: kernel output-note metadata derives sender from `account::get_id`. Both owner and beneficiary spoofing paths are tested.
 
-The contract pins the canonical `miden-standards 0.15.3` P2ID script root in `contracts/heirbeat-vault/src/p2id.rs`; integration tests verify it against the standard library. Inspect/regenerate the constant with `cargo run -p integration --example p2id_root`. The transaction host resolves the standard payout script without expected-output-note hints.
+The contract pins the canonical `miden-standards 0.16.1` P2ID script root in `contracts/heirbeat-vault/src/p2id.rs`; integration tests verify it against the standard library. Inspect/regenerate the constant with `cargo run -p integration --example p2id_root`. The transaction host resolves the standard payout script without expected-output-note hints.
 
 ## Build and verification
 
-Use the v0.15 toolchain binaries on `PATH`. Build from each contract directory because cargo-miden's top-level artifact path is relative to its working directory.
+Use the Miden v0.16.0 toolchain binaries on `PATH`. Build from each contract directory because cargo-miden's top-level artifact path is relative to its working directory.
 
 ```bash
-export PATH="$HOME/.local/share/midenup/toolchains/0.15.0/bin:$PATH"
+export PATH="$HOME/.local/share/midenup/toolchains/0.16.0/bin:$PATH"
 (cd contracts/heirbeat-vault && cargo miden build --release)
 (cd contracts/check-in-note && cargo miden build --release)
 (cd contracts/claim-note && cargo miden build --release)
@@ -66,6 +72,6 @@ MockChain executes real transaction code with dummy proofs for block application
 
 ## Versions and limitations
 
-Rust `nightly-2026-04-30`; Miden channel `0.15.0`; contract SDK `miden 0.13.1`; protocol/standards/tx/testing `0.15.3`; client/sqlite-store `0.15.2`; MAST package `0.23.4`; resolved VM crates `0.23.5`. Integration retains `cargo-miden 0.9.0` with resolved compiler dependencies `0.9.2`. No v0.16 upgrade.
+Miden channel `0.16.0`; contract SDK `miden 0.14.0`; cargo-miden/midenc `0.10.0`; client/sqlite-store `0.16.0`; protocol/standards/tx/testing `0.16.1`; VM `0.29.4`. Contract SDK build dependencies retain their official SDK-resolved RC protocol transitive dependency, isolated from the stable host/runtime graph. MockChain regression coverage remains enabled alongside the live testnet evidence above.
 
 Rust assertions lower to the VM's generic `entered unreachable code` error. Negative tests therefore use otherwise-valid funded fixtures and verify unchanged committed state, rather than treating that error alone as proof of a specific failed condition. Existing wide-arithmetic and MAST HASHLESS/STRIPPED build diagnostics are nonfatal. No upstream runtime blocker is known; production proving and network scheduling remain unverified.

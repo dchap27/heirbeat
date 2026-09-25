@@ -2293,6 +2293,147 @@ async fn submit_targeted_deposit_funding(
     Ok(())
 }
 
+async fn submit_targeted_check_in_funding(owner: AccountId, vault_id: AccountId) -> Result<()> {
+    const SPONSORSHIP_AMOUNT: u64 = 150;
+    let mut client = client().await?;
+    let sync = client.sync_state().await?;
+    let vault = client
+        .get_account(vault_id)
+        .await?
+        .context("Heirbeat vault is not tracked in the durable store")?;
+    let network_account = NetworkAccount::new(vault.clone())?;
+    let beneficiary = parse_id("0x4181277bcf64381105ee61baadb5bc")?;
+    let asset_faucet = parse_id("0x4020542183b9643120d0192be38793")?;
+    ensure!(
+        vault
+            .storage()
+            .get_item(&StorageSlotName::new(slot("owner"))?)?
+            == owner_word(owner),
+        "configured vault owner does not match heartbeat sender"
+    );
+    ensure!(
+        vault
+            .storage()
+            .get_item(&StorageSlotName::new(slot("beneficiary"))?)?
+            == owner_word(beneficiary),
+        "vault beneficiary changed"
+    );
+    ensure!(
+        vault
+            .storage()
+            .get_item(&StorageSlotName::new(slot("asset_faucet"))?)?
+            == owner_word(asset_faucet),
+        "vault inherited faucet changed"
+    );
+    ensure!(
+        vault
+            .storage()
+            .get_item(&StorageSlotName::new(slot("timeout_blocks"))?)?[0]
+            == Felt::from(10u32),
+        "vault timeout is not 10"
+    );
+    ensure!(
+        vault
+            .storage()
+            .get_item(&StorageSlotName::new(slot("last_check_in"))?)?
+            == Word::default(),
+        "vault has already been checked in; refusing to create another heartbeat"
+    );
+    ensure!(
+        vault
+            .storage()
+            .get_item(&StorageSlotName::new(slot("claimed"))?)?
+            == Word::default(),
+        "vault is already claimed"
+    );
+    let inherited_asset_id = FungibleAsset::new(asset_faucet, 1)?.id();
+    ensure!(
+        vault.vault().get_balance(inherited_asset_id)? == AssetAmount::from(100u32),
+        "vault inherited balance is not exactly 100"
+    );
+
+    let script = NoteScript::from_package(&package("check-in-note")?)?;
+    ensure!(
+        network_account
+            .allowed_notes()
+            .allowed_script_roots()
+            .contains(&script.root()),
+        "check-in root is not allowlisted"
+    );
+    let target = NetworkAccountTarget::new(vault_id, NoteExecutionHint::Always)?;
+    let mut serial_rng = rng();
+    let heartbeat_note: Note = NoteBuilder::new(owner, rng())
+        .tag(NoteTag::with_account_target(vault_id).into())
+        .note_type(NoteType::Public)
+        .script(script.clone())
+        .attachment(target)
+        .build()?;
+    let network_note =
+        miden_standards::note::AccountTargetNetworkNote::new(heartbeat_note.clone())?;
+    ensure!(
+        network_note.target_account_id() == vault_id,
+        "heartbeat targets the wrong account"
+    );
+    ensure!(
+        heartbeat_note.assets().is_empty(),
+        "check-in note must carry no assets"
+    );
+    let sponsorship_note: Note = FeeSponsorshipNote::builder()
+        .sender(owner)
+        .target_account(vault_id)
+        .feature_note_id(heartbeat_note.id())
+        .asset(FungibleAsset::new(
+            parse_id(FEE_FAUCET)?,
+            SPONSORSHIP_AMOUNT,
+        )?)
+        .generate_serial_number(&mut serial_rng)
+        .build()?
+        .into();
+    let sponsorship_storage =
+        FeeSponsorshipNoteStorage::try_from(sponsorship_note.recipient().storage().items())?;
+    ensure!(
+        sponsorship_storage.feature_note_id() == heartbeat_note.id(),
+        "sponsorship is not paired to the heartbeat note"
+    );
+    let keys = FilesystemKeyStore::new(state_dir().join(".miden/keystore"))?;
+    ensure!(
+        !keys.get_keys_for_account(&owner).await?.is_empty(),
+        "owner signer is unavailable"
+    );
+
+    let owner_tx = client
+        .submit_new_transaction(
+            owner,
+            TransactionRequestBuilder::new()
+                .own_output_notes([heartbeat_note.clone(), sponsorship_note.clone()])
+                .expected_ntx_scripts(vec![script, FeeSponsorshipNote::script()])
+                .build()?,
+        )
+        .await?;
+    let committed = committed_block(&mut client, owner_tx).await?;
+    println!("starting_sync_block={}", sync.block_num);
+    println!("owner={owner}");
+    println!("vault={vault_id}");
+    println!("owner_funding_transaction_id={owner_tx}");
+    println!("owner_funding_committed_block={committed}");
+    println!("heartbeat_note_id={}", heartbeat_note.id());
+    println!(
+        "heartbeat_script_root={}",
+        heartbeat_note.recipient().script().root()
+    );
+    println!("heartbeat_target_attachment={:?}", network_note.target());
+    println!("heartbeat_note_is_public=true");
+    println!("heartbeat_assets_empty=true");
+    println!("sponsorship_note_id={}", sponsorship_note.id());
+    println!("sponsorship_amount={SPONSORSHIP_AMOUNT}");
+    println!(
+        "sponsorship_feature_note_id={}",
+        sponsorship_storage.feature_note_id()
+    );
+    println!("network_account_transaction_submitted=false");
+    Ok(())
+}
+
 fn rng() -> impl miden_protocol::crypto::rand::FeltRng {
     let mut os_rng = rand::rng();
     miden_protocol::crypto::rand::RandomCoin::new(Word::new([
@@ -2595,6 +2736,9 @@ async fn main() -> Result<()> {
                 args[4].parse()?,
             )
             .await
+        }
+        Some("submit-targeted-check-in") if args.len() == 3 => {
+            submit_targeted_check_in_funding(parse_id(&args[1])?, parse_id(&args[2])?).await
         }
         Some(stage @ ("check-in" | "claim")) if args.len() == 3 => {
             send_note(stage, parse_id(&args[1])?, parse_id(&args[2])?, None, 0).await

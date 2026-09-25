@@ -15,7 +15,8 @@ use integration::testnet::{
     },
     notes::{assert_network_target, network_target},
     polling::PollPolicy,
-    state::{derive_deadline, ensure_claim_eligible, ensure_unclaimed},
+    security::validate_hardened_allowlists,
+    state::{derive_deadline, ensure_claim_eligible, ensure_positive_timeout, ensure_unclaimed},
 };
 use miden_client::{
     account::{
@@ -785,6 +786,7 @@ async fn verify_config(config: &TestnetConfig, json: bool) -> Result<()> {
         .storage()
         .get_item(&StorageSlotName::new(slot("timeout_blocks"))?)?[0]
         .as_canonical_u64();
+    ensure_positive_timeout(u32::try_from(timeout).context("stored timeout exceeds u32 range")?)?;
     if let Some(expected) = config.timeout_blocks {
         ensure!(
             timeout == u64::from(expected),
@@ -792,26 +794,17 @@ async fn verify_config(config: &TestnetConfig, json: bool) -> Result<()> {
         );
     }
     let roots = network.allowed_notes().allowed_script_roots();
-    let expected_roots = BTreeSet::from([
+    validate_hardened_allowlists(
+        roots,
+        network.allowed_tx_scripts().allowed_script_roots(),
         NoteScript::from_package(&package("check-in-note")?)?.root(),
         NoteScript::from_package(&package("claim-note")?)?.root(),
         NoteScript::from_package(&package("deposit-note")?)?.root(),
         NetworkAccountConfigNote::script_root(),
         FeeSponsorshipNote::script_root(),
-    ]);
-    ensure!(
-        roots == &expected_roots,
-        "note allowlist differs from exact hardened Heirbeat + v0.16 system roots"
-    );
-    ensure!(
-        network.allowed_tx_scripts().allowed_script_roots()
-            == &BTreeSet::from([ExpirationTransactionScript::script_root()]),
-        "transaction-script allowlist is not expiration-only"
-    );
-    ensure!(
-        !roots.contains(&P2idNote::script_root()),
-        "P2ID input root must remain absent"
-    );
+        P2idNote::script_root(),
+        ExpirationTransactionScript::script_root(),
+    )?;
     let inherited_balance = account
         .vault()
         .get_balance(FungibleAsset::new(faucet_id, 1)?.id())?;
@@ -867,6 +860,90 @@ async fn verify_config(config: &TestnetConfig, json: bool) -> Result<()> {
         "payout_status": payout_status,
     });
     print_status_value(&value, json)?;
+    Ok(())
+}
+
+/// Refuses post-deployment mutations when local IDs, signers, or the hardened account surface
+/// diverge from the public chain. Bootstrap commands run before a vault is configured and use
+/// their own creation-specific checks.
+async fn validate_configured_vault_for_mutation(config: &TestnetConfig) -> Result<()> {
+    ensure!(
+        config.rpc_endpoint == DEFAULT_RPC_ENDPOINT,
+        "refusing mutation: configured RPC endpoint is not the supported public testnet"
+    );
+    let owner = configured_id(&config.owner, "owner")?;
+    let beneficiary = configured_id(&config.beneficiary, "beneficiary")?;
+    let faucet_id = configured_id(&config.inherited_faucet, "inherited faucet")?;
+    let vault_id = configured_id(&config.vault, "vault")?;
+    let mut client = client().await?;
+    client.sync_state().await?;
+    for (label, id) in [
+        ("owner", owner),
+        ("beneficiary", beneficiary),
+        ("inherited faucet", faucet_id),
+    ] {
+        ensure!(
+            client.get_account(id).await?.is_some(),
+            "refusing mutation: configured {label} account is not tracked"
+        );
+    }
+    let vault = client
+        .get_account(vault_id)
+        .await?
+        .context("refusing mutation: configured vault is not tracked")?;
+    ensure!(vault.is_public(), "refusing mutation: vault is not public");
+    let network = NetworkAccount::new(vault.clone())
+        .context("refusing mutation: configured vault is not a Network Account")?;
+    for (name, id) in [
+        ("owner", owner),
+        ("beneficiary", beneficiary),
+        ("asset_faucet", faucet_id),
+    ] {
+        ensure!(
+            vault
+                .storage()
+                .get_item(&StorageSlotName::new(slot(name))?)?
+                == owner_word(id),
+            "refusing mutation: on-chain vault {name} differs from durable config"
+        );
+    }
+    if let Some(timeout) = config.timeout_blocks {
+        ensure!(
+            vault
+                .storage()
+                .get_item(&StorageSlotName::new(slot("timeout_blocks"))?)?[0]
+                == Felt::from(timeout),
+            "refusing mutation: on-chain timeout differs from durable config"
+        );
+    }
+    ensure_positive_timeout(
+        u32::try_from(
+            vault
+                .storage()
+                .get_item(&StorageSlotName::new(slot("timeout_blocks"))?)?[0]
+                .as_canonical_u64(),
+        )
+        .context("stored timeout exceeds u32 range")?,
+    )?;
+    validate_hardened_allowlists(
+        network.allowed_notes().allowed_script_roots(),
+        network.allowed_tx_scripts().allowed_script_roots(),
+        NoteScript::from_package(&package("check-in-note")?)?.root(),
+        NoteScript::from_package(&package("claim-note")?)?.root(),
+        NoteScript::from_package(&package("deposit-note")?)?.root(),
+        NetworkAccountConfigNote::script_root(),
+        FeeSponsorshipNote::script_root(),
+        P2idNote::script_root(),
+        ExpirationTransactionScript::script_root(),
+    )?;
+    let faucet_account = client
+        .get_account(faucet_id)
+        .await?
+        .context("refusing mutation: configured faucet is not tracked")?;
+    ensure!(
+        faucet_account.is_public() && FungibleFaucet::try_from(&faucet_account).is_ok(),
+        "refusing mutation: configured inherited account is not a public fungible faucet"
+    );
     Ok(())
 }
 
@@ -1335,14 +1412,17 @@ async fn verify_vault(
     let p2id = P2idNote::script_root();
     let config = NetworkAccountConfigNote::script_root();
     let sponsorship = FeeSponsorshipNote::script_root();
-    let expected_roots = BTreeSet::from([check_in, claim, deposit, config, sponsorship]);
-    let mut bootstrap_roots = expected_roots.clone();
-    bootstrap_roots.insert(p2id);
-    ensure!(
-        network_account.allowed_notes().allowed_script_roots() == &expected_roots
-            || network_account.allowed_notes().allowed_script_roots() == &bootstrap_roots,
-        "vault note allowlist differs from exact bootstrap/post-cleanup roots"
-    );
+    validate_hardened_allowlists(
+        network_account.allowed_notes().allowed_script_roots(),
+        network_account.allowed_tx_scripts().allowed_script_roots(),
+        check_in,
+        claim,
+        deposit,
+        config,
+        sponsorship,
+        p2id,
+        ExpirationTransactionScript::script_root(),
+    )?;
     let mut random = rng();
     let p2id_probe: Note = P2idNote::builder()
         .sender(owner)
@@ -1352,11 +1432,6 @@ async fn verify_vault(
         .generate_serial_number(&mut random)
         .build()?
         .into();
-    ensure!(
-        network_account.allowed_tx_scripts().allowed_script_roots()
-            == &BTreeSet::from([ExpirationTransactionScript::script_root()]),
-        "vault transaction-script allowlist differs from the canonical Network Account default"
-    );
     let inherited_balance = account
         .vault()
         .get_balance(FungibleAsset::new(asset_faucet, 1)?.id())?;
@@ -1393,14 +1468,7 @@ async fn verify_vault(
         ExpirationTransactionScript::script_root()
     );
     println!("constructed_p2id_probe_note_id={}", p2id_probe.id());
-    println!(
-        "allowlist_stage={}",
-        if network_account.allowed_notes().allowed_script_roots() == &expected_roots {
-            "hardened"
-        } else {
-            "bootstrap_pending_cleanup"
-        }
-    );
+    println!("allowlist_stage=hardened");
     println!(
         "p2id_rejection=locally confirmed: {}",
         if network_account
@@ -1882,6 +1950,17 @@ async fn submit_feature_command(
     if kind == "claim" {
         ensure_claim_eligible(sync.block_num.as_u32(), deadline)?;
     }
+    validate_hardened_allowlists(
+        network.allowed_notes().allowed_script_roots(),
+        network.allowed_tx_scripts().allowed_script_roots(),
+        NoteScript::from_package(&package("check-in-note")?)?.root(),
+        NoteScript::from_package(&package("claim-note")?)?.root(),
+        NoteScript::from_package(&package("deposit-note")?)?.root(),
+        NetworkAccountConfigNote::script_root(),
+        FeeSponsorshipNote::script_root(),
+        P2idNote::script_root(),
+        ExpirationTransactionScript::script_root(),
+    )?;
     let asset_id = FungibleAsset::new(faucet_id, 1)?.id();
     let inherited_before = vault.vault().get_balance(asset_id)?;
     if kind == "deposit" {
@@ -2333,6 +2412,13 @@ async fn main() -> Result<()> {
             .transpose()?
             .unwrap_or(config.timeout_seconds),
     )?;
+    if matches!(
+        command,
+        "mint" | "deposit" | "heartbeat" | "claim" | "consume" | "fund-fees"
+    ) && config.vault.is_some()
+    {
+        validate_configured_vault_for_mutation(&config).await?;
+    }
     match command {
         "configure" => {
             if let Some(value) = values.get("owner") {
@@ -2461,7 +2547,7 @@ async fn main() -> Result<()> {
                 .transpose()?
                 .or(config.timeout_blocks)
                 .context("--timeout or configured timeout is required")?;
-            ensure!(timeout > 0, "timeout_blocks must be positive");
+            ensure_positive_timeout(timeout)?;
             ensure!(config.timeout_blocks.map_or(true, |saved| saved == timeout), "requested timeout differs from durable config; use configure to update it before deployment");
             config.timeout_blocks = Some(timeout);
             config.poll_seconds = policy.poll_seconds;
@@ -2594,6 +2680,11 @@ async fn main() -> Result<()> {
             let beneficiary = configured_id(&config.beneficiary, "beneficiary")?;
             let vault = configured_id(&config.vault, "vault")?;
             let faucet = configured_id(&config.inherited_faucet, "inherited faucet")?;
+            let keys = FilesystemKeyStore::new(state_dir().join(".miden/keystore"))?;
+            ensure!(
+                !keys.get_keys_for_account(&beneficiary).await?.is_empty(),
+                "configured beneficiary signer is missing from the durable keystore"
+            );
             let note_text = values
                 .get("note")
                 .or(config.payout_note_id.as_ref())

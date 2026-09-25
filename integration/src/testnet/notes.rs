@@ -27,6 +27,8 @@ pub fn assert_network_target(note: &Note, expected_vault: AccountId) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use miden_protocol::{note::NoteAttachment, Word};
+    use miden_standards::testing::note::NoteBuilder;
 
     #[test]
     fn target_is_constructed_with_always_hint() {
@@ -34,5 +36,49 @@ mod tests {
         let target = network_target(account).unwrap();
         assert_eq!(target.target_id(), account);
         assert_eq!(target.execution_hint(), NoteExecutionHint::Always);
+    }
+
+    fn public_account(hex: &str) -> AccountId {
+        AccountId::from_hex(hex).unwrap()
+    }
+
+    fn note_with_attachment(sender: AccountId, attachment: impl Into<NoteAttachment>) -> Note {
+        NoteBuilder::new(sender, rand::rng())
+            .attachment(attachment)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn security_target_accepts_only_the_intended_vault() {
+        let vault = public_account("0x39fcc854fe715ad1446afb9859df04");
+        let owner = public_account("0xa61714a99ec7619109e397cbac32cd");
+        let note = note_with_attachment(owner, network_target(vault).unwrap());
+        assert_network_target(&note, vault).unwrap();
+    }
+
+    #[test]
+    fn security_target_rejects_wrong_and_unrelated_network_accounts() {
+        let vault = public_account("0x39fcc854fe715ad1446afb9859df04");
+        let other = public_account("0x0204e51ba4ed7ad12a91576128ee90");
+        let note = note_with_attachment(other, network_target(other).unwrap());
+        let error = assert_network_target(&note, vault).unwrap_err().to_string();
+        assert!(error.contains("expected"));
+    }
+
+    #[test]
+    fn security_target_rejects_missing_and_malformed_attachments() {
+        let vault = public_account("0x39fcc854fe715ad1446afb9859df04");
+        let owner = public_account("0xa61714a99ec7619109e397cbac32cd");
+        let missing = NoteBuilder::new(owner, rand::rng()).build().unwrap();
+        assert!(assert_network_target(&missing, vault).is_err());
+
+        let malformed = NoteAttachment::with_words(
+            NetworkAccountTarget::ATTACHMENT_SCHEME,
+            vec![Word::default(), Word::default()],
+        )
+        .unwrap();
+        let malformed_note = note_with_attachment(owner, malformed);
+        assert!(assert_network_target(&malformed_note, vault).is_err());
     }
 }

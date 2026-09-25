@@ -90,6 +90,32 @@ mod tests {
     }
 
     #[test]
+    fn security_sponsorship_amount_is_positive_and_independent_of_inherited_asset() {
+        let sender = AccountId::from_hex("0x39fcc854fe715ad1446afb9859df04").unwrap();
+        let faucet = AccountId::from_hex("0x18101fa522c174b165efd4f70a0385").unwrap();
+        let feature = NoteId::try_from_hex(
+            "0x9a432906999582825c1e15d69f53312a6f8e84c8787bb26029ffcba850cc852d",
+        )
+        .unwrap();
+        let mut rng =
+            miden_protocol::crypto::rand::RandomCoin::new(miden_protocol::Word::default());
+        assert!(build_network_sponsorship(sender, sender, feature, faucet, 0, &mut rng).is_err());
+        let excessive_but_representable =
+            build_network_sponsorship(sender, sender, feature, faucet, u32::MAX as u64, &mut rng)
+                .unwrap();
+        assert_eq!(
+            excessive_but_representable.metadata().sender(),
+            sender,
+            "sponsorship construction does not change feature-note sender"
+        );
+        assert!(ensure_sponsorship_pair(
+            feature,
+            excessive_but_representable.recipient().storage().items()
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn normal_wallet_fee_funding_is_a_public_p2id_note() {
         let account = AccountId::from_hex("0x39fcc854fe715ad1446afb9859df04").unwrap();
         let faucet = AccountId::from_hex("0x18101fa522c174b165efd4f70a0385").unwrap();

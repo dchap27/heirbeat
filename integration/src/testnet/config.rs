@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_RPC_ENDPOINT: &str = "https://rpc.testnet.miden.io";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct TestnetConfig {
     pub schema_version: u32,
     pub rpc_endpoint: String,
@@ -123,5 +123,14 @@ mod tests {
         assert!(config
             .ensure_unconfigured("inherited faucet", config.inherited_faucet.as_deref(), true)
             .is_ok());
+    }
+
+    #[test]
+    fn security_config_rejects_unrecognized_fields_including_secret_like_fields() {
+        let error = serde_json::from_str::<TestnetConfig>(
+            r#"{"schema_version":1,"private_key":"never-accepted"}"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
     }
 }

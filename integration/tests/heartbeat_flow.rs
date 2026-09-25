@@ -27,8 +27,8 @@ use miden_standards::{
     },
     errors::standards::ERR_NOTE_SCRIPT_ALLOWLIST_NOTE_NOT_ALLOWED,
     note::{
-        AccountTargetNetworkNote, FeeSponsorshipNote, NetworkAccountConfigNote,
-        NetworkAccountTarget, NoteExecutionHint, P2idNote,
+        AccountTargetNetworkNote, FeeSponsorshipNote, NetworkAccountConfig,
+        NetworkAccountConfigNote, NetworkAccountTarget, NoteExecutionHint, P2idNote,
     },
     testing::note::NoteBuilder,
     tx_script::{ExpirationTransactionScript, SendNotesTransactionScript},
@@ -938,6 +938,85 @@ async fn deposit_recipient_is_enforced_independently_of_routing_tag() -> Result<
     Ok(())
 }
 
+async fn assert_replay_rejected_by_block_nullifier(
+    chain: &MockChain,
+    account: AccountId,
+    note: &Note,
+) -> Result<()> {
+    let before = chain.committed_account(account)?.clone();
+    let mut replay_chain = chain.clone();
+    // MockChain's transaction executor can simulate an already-consumed note because it retains
+    // historical note records. Replay protection is enforced when the block validates its
+    // nullifier witness, matching the chain-level uniqueness boundary.
+    let transaction = replay_chain
+        .build_transaction(account)
+        .authenticated_input_note(note.id())
+        .build();
+    let transaction = match transaction {
+        Ok(transaction) => transaction,
+        Err(_) => {
+            assert_eq!(replay_chain.committed_account(account)?, &before);
+            assert!(chain.is_note_consumed(&note.nullifier()));
+            return Ok(());
+        }
+    };
+    let executed = match transaction.execute().await {
+        Ok(executed) => executed,
+        Err(_) => {
+            assert_eq!(replay_chain.committed_account(account)?, &before);
+            assert!(chain.is_note_consumed(&note.nullifier()));
+            return Ok(());
+        }
+    };
+    replay_chain.add_pending_executed_transaction(&executed)?;
+    let error = replay_chain
+        .prove_next_block()
+        .expect_err("a block must reject an already-spent note nullifier");
+    assert!(format!("{error:?}").contains("already spent"), "{error:?}");
+    assert_eq!(replay_chain.committed_account(account)?, &before);
+    assert!(chain.is_note_consumed(&note.nullifier()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn security_replay_consumed_feature_and_payout_notes_cannot_execute_twice() -> Result<()> {
+    let mut h = Harness::configured(5, 0)?;
+    let deposit = h.fund(h.owner.id(), 100, 181).await?;
+    let after_deposit = h.state()?.clone();
+    assert_replay_rejected_by_block_nullifier(&h.chain, h.vault, &deposit).await?;
+    assert_eq!(h.state()?, &after_deposit);
+    assert!(h.chain.is_note_consumed(&deposit.nullifier()));
+
+    let heartbeat = h.note(h.owner.id(), 182)?;
+    h.send(h.owner.id(), &[heartbeat.clone()]).await?;
+    h.check_in(&heartbeat).await?;
+    let last = scalar(h.state()?, "last_check_in")?;
+    let after_heartbeat = h.state()?.clone();
+    assert_replay_rejected_by_block_nullifier(&h.chain, h.vault, &heartbeat).await?;
+    assert_eq!(h.state()?, &after_heartbeat);
+    assert_eq!(scalar(h.state()?, "last_check_in")?, last);
+    assert!(h.chain.is_note_consumed(&heartbeat.nullifier()));
+
+    let claim = h.claim_note(h.beneficiary.id(), 183)?;
+    h.send(h.beneficiary.id(), &[claim.clone()]).await?;
+    let deadline = last + 5;
+    let current = h.chain.latest_block_header().block_num().as_u32();
+    h.advance_to(current.max(deadline))?;
+    let reference = h.chain.latest_block_header().block_num().as_u32();
+    let payout = h.claim(&claim, reference).await?;
+    h.receive_payout(&payout, 100).await?;
+    let final_state = h.state()?.clone();
+
+    assert_replay_rejected_by_block_nullifier(&h.chain, h.vault, &claim).await?;
+    assert_replay_rejected_by_block_nullifier(&h.chain, h.beneficiary.id(), &payout).await?;
+    assert_eq!(h.state()?, &final_state);
+    assert_eq!(scalar(h.state()?, "claimed")?, 1);
+    assert_eq!(balance(h.state()?), 0);
+    assert!(h.chain.is_note_consumed(&claim.nullifier()));
+    assert!(h.chain.is_note_consumed(&payout.nullifier()));
+    Ok(())
+}
+
 #[test]
 fn public_feature_note_has_canonical_network_account_target_attachment() -> Result<()> {
     let h = Harness::new()?;
@@ -965,6 +1044,30 @@ fn public_feature_note_has_canonical_network_account_target_attachment() -> Resu
         .allowed_script_roots()
         .contains(&note.recipient().script().root()));
 
+    Ok(())
+}
+
+async fn commit_public_note(
+    chain: &mut MockChain,
+    sender: AccountId,
+    target: AccountId,
+    note: &Note,
+) -> Result<()> {
+    let partial = PartialNote::from(note.clone());
+    let send_script = SendNotesTransactionScript::new(
+        &chain.committed_account(sender)?.code_interface(),
+        &[partial],
+    )?;
+    let sent = chain
+        .build_transaction(sender)
+        .foreign_accounts([chain.get_foreign_account_inputs(target)?])
+        .send_notes_script(&send_script)
+        .expected_output_notes(vec![RawOutputNote::Full(note.clone())])
+        .build()?
+        .execute()
+        .await?;
+    chain.add_pending_executed_transaction(&sent)?;
+    chain.prove_next_block()?;
     Ok(())
 }
 
@@ -1135,6 +1238,265 @@ async fn fee_sponsorship_bootstraps_empty_network_account() -> Result<()> {
     assert!(chain.is_note_consumed(&sponsored_fee.nullifier()));
     assert!(chain.is_note_committed(&feature.id()));
     assert!(chain.is_note_committed(&sponsored_fee.id()));
+    assert_replay_rejected_by_block_nullifier(&chain, account.id(), &sponsored_fee).await?;
 
+    // NetworkAccountConfigNote authorization is account-wide authority, not ownership of the
+    // note root. The beneficiary cannot remove a root; the configured owner can intentionally
+    // remove and re-add roots (including bootstrap P2ID) and transaction-script permissions.
+    let check_in_root = check_in.root();
+    let unauthorized_config: Note = NetworkAccountConfigNote::builder()
+        .sender(beneficiary.id())
+        .target(account.id())
+        .config(NetworkAccountConfig::RemoveAllowedNoteScript {
+            script_root: check_in_root,
+        })
+        .generate_serial_number(note_rng.rng_mut())
+        .build()?
+        .into();
+    commit_public_note(
+        &mut chain,
+        beneficiary.id(),
+        account.id(),
+        &unauthorized_config,
+    )
+    .await?;
+    let config_state_before = chain.committed_account(account.id())?.clone();
+    let unauthorized = chain
+        .build_transaction(account.id())
+        .foreign_accounts([chain.get_foreign_account_inputs(beneficiary.id())?])
+        .authenticated_input_note(unauthorized_config.id())
+        .build()?
+        .execute()
+        .await;
+    assert!(unauthorized.is_err(), "non-owner config note was accepted");
+    assert_eq!(chain.committed_account(account.id())?, &config_state_before);
+    assert!(!chain.is_note_consumed(&unauthorized_config.nullifier()));
+
+    let remove_p2id: Note = NetworkAccountConfigNote::builder()
+        .sender(owner.id())
+        .target(account.id())
+        .config(NetworkAccountConfig::RemoveAllowedNoteScript {
+            script_root: p2id_root,
+        })
+        .generate_serial_number(note_rng.rng_mut())
+        .build()?
+        .into();
+    commit_public_note(&mut chain, owner.id(), account.id(), &remove_p2id).await?;
+    let remove_p2id_tx = chain
+        .build_transaction(account.id())
+        .foreign_accounts([chain.get_foreign_account_inputs(owner.id())?])
+        .authenticated_input_note(remove_p2id.id())
+        .build()?
+        .execute()
+        .await?;
+    chain.add_pending_executed_transaction(&remove_p2id_tx)?;
+    chain.prove_next_block()?;
+    assert!(!NetworkAccountNoteAllowlist::try_from(
+        chain.committed_account(account.id())?.storage()
+    )?
+    .allowed_script_roots()
+    .contains(&p2id_root));
+
+    let add_p2id: Note = NetworkAccountConfigNote::builder()
+        .sender(owner.id())
+        .target(account.id())
+        .config(NetworkAccountConfig::AddAllowedNoteScript {
+            script_root: p2id_root,
+        })
+        .generate_serial_number(note_rng.rng_mut())
+        .build()?
+        .into();
+    commit_public_note(&mut chain, owner.id(), account.id(), &add_p2id).await?;
+    let add_p2id_tx = chain
+        .build_transaction(account.id())
+        .foreign_accounts([chain.get_foreign_account_inputs(owner.id())?])
+        .authenticated_input_note(add_p2id.id())
+        .build()?
+        .execute()
+        .await?;
+    chain.add_pending_executed_transaction(&add_p2id_tx)?;
+    chain.prove_next_block()?;
+    assert!(NetworkAccountNoteAllowlist::try_from(
+        chain.committed_account(account.id())?.storage()
+    )?
+    .allowed_script_roots()
+    .contains(&p2id_root));
+
+    let remove_check_in: Note = NetworkAccountConfigNote::builder()
+        .sender(owner.id())
+        .target(account.id())
+        .config(NetworkAccountConfig::RemoveAllowedNoteScript {
+            script_root: check_in_root,
+        })
+        .generate_serial_number(note_rng.rng_mut())
+        .build()?
+        .into();
+    commit_public_note(&mut chain, owner.id(), account.id(), &remove_check_in).await?;
+    let remove_check_in_tx = chain
+        .build_transaction(account.id())
+        .foreign_accounts([chain.get_foreign_account_inputs(owner.id())?])
+        .authenticated_input_note(remove_check_in.id())
+        .build()?
+        .execute()
+        .await?;
+    chain.add_pending_executed_transaction(&remove_check_in_tx)?;
+    chain.prove_next_block()?;
+    assert!(!NetworkAccountNoteAllowlist::try_from(
+        chain.committed_account(account.id())?.storage()
+    )?
+    .allowed_script_roots()
+    .contains(&check_in_root));
+
+    let add_check_in: Note = NetworkAccountConfigNote::builder()
+        .sender(owner.id())
+        .target(account.id())
+        .config(NetworkAccountConfig::AddAllowedNoteScript {
+            script_root: check_in_root,
+        })
+        .generate_serial_number(note_rng.rng_mut())
+        .build()?
+        .into();
+    commit_public_note(&mut chain, owner.id(), account.id(), &add_check_in).await?;
+    let add_check_in_tx = chain
+        .build_transaction(account.id())
+        .foreign_accounts([chain.get_foreign_account_inputs(owner.id())?])
+        .authenticated_input_note(add_check_in.id())
+        .build()?
+        .execute()
+        .await?;
+    chain.add_pending_executed_transaction(&add_check_in_tx)?;
+    chain.prove_next_block()?;
+    assert!(NetworkAccountNoteAllowlist::try_from(
+        chain.committed_account(account.id())?.storage()
+    )?
+    .allowed_script_roots()
+    .contains(&check_in_root));
+
+    let expiration_root = ExpirationTransactionScript::script_root();
+    let remove_expiration: Note = NetworkAccountConfigNote::builder()
+        .sender(owner.id())
+        .target(account.id())
+        .config(NetworkAccountConfig::RemoveAllowedTxScript {
+            script_root: expiration_root,
+        })
+        .generate_serial_number(note_rng.rng_mut())
+        .build()?
+        .into();
+    commit_public_note(&mut chain, owner.id(), account.id(), &remove_expiration).await?;
+    let remove_expiration_tx = chain
+        .build_transaction(account.id())
+        .foreign_accounts([chain.get_foreign_account_inputs(owner.id())?])
+        .authenticated_input_note(remove_expiration.id())
+        .build()?
+        .execute()
+        .await?;
+    chain.add_pending_executed_transaction(&remove_expiration_tx)?;
+    chain.prove_next_block()?;
+    assert!(!NetworkAccountTxScriptAllowlist::try_from(
+        chain.committed_account(account.id())?.storage()
+    )?
+    .allowed_script_roots()
+    .contains(&expiration_root));
+
+    let add_expiration: Note = NetworkAccountConfigNote::builder()
+        .sender(owner.id())
+        .target(account.id())
+        .config(NetworkAccountConfig::AddAllowedTxScript {
+            script_root: expiration_root,
+        })
+        .generate_serial_number(note_rng.rng_mut())
+        .build()?
+        .into();
+    commit_public_note(&mut chain, owner.id(), account.id(), &add_expiration).await?;
+    let add_expiration_tx = chain
+        .build_transaction(account.id())
+        .foreign_accounts([chain.get_foreign_account_inputs(owner.id())?])
+        .authenticated_input_note(add_expiration.id())
+        .build()?
+        .execute()
+        .await?;
+    chain.add_pending_executed_transaction(&add_expiration_tx)?;
+    chain.prove_next_block()?;
+    assert_eq!(
+        NetworkAccountTxScriptAllowlist::try_from(
+            chain.committed_account(account.id())?.storage()
+        )?
+        .allowed_script_roots(),
+        &BTreeSet::from([expiration_root])
+    );
+
+    for system_root in [sponsorship_root, NetworkAccountConfigNote::script_root()] {
+        let remove_system_root: Note = NetworkAccountConfigNote::builder()
+            .sender(owner.id())
+            .target(account.id())
+            .config(NetworkAccountConfig::RemoveAllowedNoteScript {
+                script_root: system_root,
+            })
+            .generate_serial_number(note_rng.rng_mut())
+            .build()?
+            .into();
+        commit_public_note(&mut chain, owner.id(), account.id(), &remove_system_root).await?;
+        let remove_system_root_tx = chain
+            .build_transaction(account.id())
+            .foreign_accounts([chain.get_foreign_account_inputs(owner.id())?])
+            .authenticated_input_note(remove_system_root.id())
+            .build()?
+            .execute()
+            .await?;
+        chain.add_pending_executed_transaction(&remove_system_root_tx)?;
+        chain.prove_next_block()?;
+        assert!(!NetworkAccountNoteAllowlist::try_from(
+            chain.committed_account(account.id())?.storage()
+        )?
+        .allowed_script_roots()
+        .contains(&system_root));
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn security_unallowlisted_feature_and_paired_sponsorship_cannot_mutate_vault() -> Result<()> {
+    let mut h = Harness::new()?;
+    let mut note_rng = MockChain::builder();
+    let feature = NoteBuilder::new(h.owner.id(), note_rng.rng_mut())
+        .tag(NoteTag::with_account_target(h.vault).into())
+        .code("@note_script pub proc main push.0 drop end")
+        .build()?;
+    let fee_note: Note = FeeSponsorshipNote::builder()
+        .sender(h.owner.id())
+        .target_account(h.vault)
+        .feature_note_id(feature.id())
+        // Use the inherited test asset as an inert sponsorship asset. Network Account auth must
+        // reject the paired operation because the feature root is not allowlisted.
+        .asset(supported(1))
+        .generate_serial_number(note_rng.rng_mut())
+        .build()?
+        .into();
+    assert_eq!(
+        miden_standards::note::FeeSponsorshipNoteStorage::try_from(
+            fee_note.recipient().storage().items()
+        )?
+        .feature_note_id(),
+        feature.id()
+    );
+    h.send(h.owner.id(), &[feature.clone(), fee_note.clone()])
+        .await?;
+    let before = h.state()?.clone();
+    let notes_before = h.chain.committed_notes().len();
+    let result = h
+        .chain
+        .build_transaction(h.vault)
+        .authenticated_input_notes([feature.id(), fee_note.id()])
+        .build()?
+        .execute()
+        .await;
+    assert!(result.is_err(), "unallowlisted paired feature was accepted");
+    h.chain.prove_next_block()?;
+    assert_eq!(h.state()?, &before);
+    assert_eq!(balance(h.state()?), 0);
+    assert_eq!(h.chain.committed_notes().len(), notes_before);
+    assert!(!h.chain.is_note_consumed(&feature.nullifier()));
+    assert!(!h.chain.is_note_consumed(&fee_note.nullifier()));
     Ok(())
 }

@@ -6,6 +6,11 @@ pub fn derive_deadline(last_check_in: u32, timeout_blocks: u32) -> Result<u64> {
         .ok_or_else(|| anyhow::anyhow!("deadline arithmetic overflow"))
 }
 
+pub fn ensure_positive_timeout(timeout_blocks: u32) -> Result<()> {
+    anyhow::ensure!(timeout_blocks > 0, "timeout_blocks must be positive");
+    Ok(())
+}
+
 pub fn ensure_unclaimed(claimed: bool, operation: &str) -> Result<()> {
     if claimed {
         let message = match operation {
@@ -33,6 +38,22 @@ mod tests {
     #[test]
     fn deadline_is_widened_before_addition() {
         assert_eq!(derive_deadline(u32::MAX, u32::MAX).unwrap(), 8_589_934_590);
+    }
+
+    #[test]
+    fn security_timeout_edges_do_not_wrap() {
+        assert_eq!(derive_deadline(0, 0).unwrap(), 0);
+        assert_eq!(derive_deadline(0, 1).unwrap(), 1);
+        assert_eq!(derive_deadline(u32::MAX - 1, 1).unwrap(), u32::MAX as u64);
+        assert_eq!(derive_deadline(u32::MAX, 1).unwrap(), u32::MAX as u64 + 1);
+        assert_eq!(derive_deadline(u32::MAX, u32::MAX).unwrap(), 8_589_934_590);
+    }
+
+    #[test]
+    fn security_new_vault_timeout_rejects_zero_but_accepts_protocol_edges() {
+        assert!(ensure_positive_timeout(0).is_err());
+        assert!(ensure_positive_timeout(1).is_ok());
+        assert!(ensure_positive_timeout(u32::MAX).is_ok());
     }
 
     #[test]

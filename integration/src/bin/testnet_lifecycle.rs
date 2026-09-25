@@ -579,6 +579,7 @@ async fn status_snapshot(config: &TestnetConfig) -> Result<serde_json::Value> {
     let mut owner_signer = false;
     let mut beneficiary_signer = false;
     let mut vault_data = serde_json::Value::Null;
+    let mut vault_transaction_count = None;
     let asset_id = faucet_id
         .map(|id| FungibleAsset::new(id, 1).map(|asset| asset.id()))
         .transpose()?;
@@ -616,6 +617,11 @@ async fn status_snapshot(config: &TestnetConfig) -> Result<serde_json::Value> {
         }
     }
     if let Some(id) = vault_id {
+        vault_transaction_count = Some(
+            rpc.sync_transactions(BlockNumber::GENESIS, header.block_num(), vec![id])
+                .await?
+                .len(),
+        );
         if let Some(account) = client.get_account(id).await? {
             let network = NetworkAccount::new(account.clone()).ok();
             let owner = account
@@ -693,6 +699,7 @@ async fn status_snapshot(config: &TestnetConfig) -> Result<serde_json::Value> {
             "faucet": faucet_signer,
         },
         "vault": vault_data,
+        "vault_transaction_count": vault_transaction_count,
         "assets": {
             "symbol": config.asset_symbol,
             "owner_balance": owner_balance,
@@ -707,6 +714,24 @@ async fn status_snapshot(config: &TestnetConfig) -> Result<serde_json::Value> {
 fn print_status_value(value: &serde_json::Value, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(value)?);
+    } else if value.get("verified").is_some() {
+        println!("verified={}", value["verified"]);
+        println!("sync_block={}", value["sync_block"]);
+        println!("vault={}", value["vault"]);
+        println!("owner={}", value["owner"]);
+        println!("beneficiary={}", value["beneficiary"]);
+        println!("faucet={}", value["faucet"]);
+        println!("timeout_blocks={}", value["timeout_blocks"]);
+        println!("claimed={}", value["claimed"]);
+        println!("inherited_balance={}", value["inherited_balance"]);
+        println!("native_fee_balance={}", value["native_fee_balance"]);
+        println!("faucet_supply={}", value["faucet_supply"]);
+        println!("allowlist_roots={}", value["allowlist_roots"]);
+        println!(
+            "transaction_script_roots={}",
+            value["transaction_script_roots"]
+        );
+        println!("payout_status={}", value["payout_status"]);
     } else {
         println!("network={}", value["network"]);
         println!("accounts={}", value["accounts"]);
@@ -812,8 +837,8 @@ async fn verify_config(config: &TestnetConfig, json: bool) -> Result<()> {
             .await?
             .map(|note| {
                 serde_json::json!({
-                    "note_id": note_id.to_string(),
-                    "committed": note.is_committed(),
+                "note_id": note_id.to_string(),
+                "committed": note.is_committed() || note.is_consumed(),
                     "consumed": note.is_consumed(),
                     "consumer": note.consumer_account().map(|id| id.to_string()),
                 })

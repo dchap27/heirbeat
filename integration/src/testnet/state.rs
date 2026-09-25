@@ -8,7 +8,13 @@ pub fn derive_deadline(last_check_in: u32, timeout_blocks: u32) -> Result<u64> {
 
 pub fn ensure_unclaimed(claimed: bool, operation: &str) -> Result<()> {
     if claimed {
-        bail!("vault is already claimed; {operation} is disabled for terminal vaults");
+        let message = match operation {
+            "heartbeat" => "Vault is already claimed; heartbeat is not permitted.",
+            "claim" => "Vault is already claimed; claim cannot be repeated.",
+            "deposit" => "Vault is already claimed; deposits are not permitted.",
+            _ => "Vault is already claimed; this operation is not permitted.",
+        };
+        bail!("{message}");
     }
     Ok(())
 }

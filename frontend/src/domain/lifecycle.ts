@@ -1,5 +1,5 @@
 import type { DerivedVaultState, VaultLifecycleState, VaultRole, VaultSnapshot } from "./types";
-import { AccountId } from "@miden-sdk/miden-sdk";
+import { AccountId, Address } from "@miden-sdk/miden-sdk";
 
 export function deriveDeadline(lastCheckIn: bigint, timeoutBlocks: bigint): bigint {
   return lastCheckIn + timeoutBlocks;
@@ -7,19 +7,24 @@ export function deriveDeadline(lastCheckIn: bigint, timeoutBlocks: bigint): bigi
 
 export function deriveRole(walletAccountId: string | null, owner: string, beneficiary: string): VaultRole {
   if (!walletAccountId) return "observer";
-  const connectedId = normalizeAccountId(walletAccountId);
-  if (connectedId === normalizeAccountId(owner)) return "owner";
-  if (connectedId === normalizeAccountId(beneficiary)) return "beneficiary";
-  return "observer";
+  try {
+    const connectedId = normalizeAccountId(walletAccountId);
+    if (connectedId === normalizeAccountId(owner)) return "owner";
+    if (connectedId === normalizeAccountId(beneficiary)) return "beneficiary";
+    return "observer";
+  } catch {
+    // A malformed wallet/provider value must never crash a read-only render or
+    // accidentally grant a role.
+    return "observer";
+  }
 }
 
-/** Wallets may expose AccountId as Bech32 while chain snapshots use canonical hex. */
+/** Normalize hex AccountIds and Bech32 wallet addresses to canonical AccountId hex. */
 export function normalizeAccountId(value: string): string {
-  try {
-    return AccountId.fromHex(value).toString().toLowerCase();
-  } catch {
-    return AccountId.fromBech32(value).toString().toLowerCase();
-  }
+  const accountId = /^0x/i.test(value)
+    ? AccountId.fromHex(value)
+    : Address.fromBech32(value).accountId();
+  return accountId.toString().toLowerCase();
 }
 
 export function deriveLifecycle(snapshot: VaultSnapshot): DerivedVaultState {

@@ -22,4 +22,6 @@ input, select { width: 100%; min-height: 42px; padding: 8px 10px; border: 1px so
 .value span { color: #9eb1c7; font-size: .78rem; }
 pre { max-width: 100%; margin: 8px 0 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: .82rem; }
 footer { padding: 18px 0; }
+.danger-notice { padding: 14px; border: 2px solid #e6a338; border-radius: 8px; background: #382814; color: #ffe0a3; line-height: 1.5; }
+.preview-panel button { background: #653826; border-color: #e6a338; }
 @media (max-width: 700px) { .topbar { align-items: flex-start; flex-direction: column; } .wallet-controls { justify-content: flex-start; } }

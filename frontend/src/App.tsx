@@ -146,7 +146,7 @@ export function App() {
   async function checkNtx() {
     if (!client || !noteId) return setError("Connect the client and enter a committed network-note ID.");
     setNtxError(null);
-    await run(() => readNtxStatus(client, noteId), (status) => {
+    await run(() => readNtxStatus(endpoint, noteId), (status) => {
       const result = `${status.status} (attempts: ${status.attemptCount}, last block: ${status.lastAttemptBlockNum})`;
       setNtxResult(result);
       setDiagnostic({ noteId, status: status.status, attemptCount: status.attemptCount, lastAttemptBlockNum: status.lastAttemptBlockNum, lastError: status.lastError });
@@ -228,8 +228,10 @@ export function App() {
 
       <section className="panel">
         <h2>NTX status probe</h2>
-        <p className="muted">Read-only GetNetworkNoteStatus via the Web SDK’s internal raw-client bridge; this is not a stable high-level React API.</p>
+        <p className="muted">Read-only GetNetworkNoteStatus via the Web SDK’s public standalone RpcClient. Historical notes may no longer be indexed; an RPC error is shown separately from a returned note status.</p>
         <div className="controls"><label>Committed note ID<input value={noteId} onChange={(event) => setNoteId(event.target.value)} placeholder="0x…" /></label><button onClick={checkNtx} disabled={!client || busy}>Query status</button></div>
+        <Value name="NTX query result" value={ntxResult} />
+        <Value name="NTX query error" value={ntxError ?? "none"} />
       </section>
 
       <section className="panel">
@@ -241,7 +243,7 @@ export function App() {
           <Value name="Activation note construction" value="available locally; select and validate above" />
           <Value name="FeeSponsorship pairing" value="built and paired by local feature-note constructor" />
           <Value name="NetworkAccountTarget" value="included by local feature-note constructor" />
-          <Value name="NTX status" value="internal Web SDK bridge; query above" />
+          <Value name="NTX status" value="public Web SDK RpcClient; query above" />
           <Value name="P2ID consume request" value="local validated-note helper available; wallet handoff not implemented in this diagnostic page" />
           <Value name="Transaction submission" value="disabled; no wallet request is sent" />
           <Value name="NTX result / last error" value={`${ntxResult} / ${ntxError ?? "none"}`} />

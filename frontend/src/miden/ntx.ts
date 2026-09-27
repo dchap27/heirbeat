@@ -1,18 +1,31 @@
-import { NoteId } from "@miden-sdk/miden-sdk";
-import type { MidenClient, NetworkNoteStatusInfo } from "@miden-sdk/miden-sdk";
+import { Endpoint, NoteId, RpcClient } from "@miden-sdk/miden-sdk";
+
+export interface NtxStatusResult {
+  status: string;
+  attemptCount: number;
+  lastAttemptBlockNum: number | undefined;
+  lastError: string | undefined;
+}
 
 /**
- * The raw WASM WebClient exposes GetNetworkNoteStatus; MidenClient currently has
- * no public resource method, so this uses its explicitly internal serialized bridge.
+ * Query NTX status through the Web SDK's public standalone RPC client. Keep this
+ * transport detail isolated here so UI components do not depend on SDK internals.
  */
-export async function readNtxStatus(client: MidenClient, noteId: string): Promise<NetworkNoteStatusInfo> {
-  type Raw = { getNetworkNoteStatus(id: NoteId): Promise<NetworkNoteStatusInfo> };
-  type InternalClient = MidenClient & {
-    _withInnerWebClient<T>(fn: (raw: Raw) => Promise<T>): Promise<T>;
-  };
-  const internal = client as InternalClient;
-  if (typeof internal._withInnerWebClient !== "function") {
-    throw new Error("This Web SDK build does not expose its internal network-note status bridge.");
+export async function readNtxStatus(endpoint: string, noteId: string): Promise<NtxStatusResult> {
+  const rpc = new RpcClient(new Endpoint(endpoint));
+  try {
+    const status = await rpc.getNetworkNoteStatus(NoteId.fromHex(noteId));
+    try {
+      return {
+        status: status.status,
+        attemptCount: status.attemptCount,
+        lastAttemptBlockNum: status.lastAttemptBlockNum,
+        lastError: status.lastError,
+      };
+    } finally {
+      status.free();
+    }
+  } finally {
+    rpc.free();
   }
-  return internal._withInnerWebClient((raw) => raw.getNetworkNoteStatus(NoteId.fromHex(noteId)));
 }

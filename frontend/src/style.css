@@ -1,0 +1,27 @@
+:root { font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #ecf1f7; background: #10151d; font-synthesis: none; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; }
+button, input, select { font: inherit; }
+button { padding: .7rem 1rem; border: 1px solid #6b8fc4; border-radius: 8px; background: #26466f; color: white; cursor: pointer; }
+button:disabled { opacity: .55; cursor: wait; }
+.shell { width: min(1160px, calc(100% - 32px)); margin: 32px auto 60px; }
+.topbar { display: flex; align-items: center; justify-content: space-between; gap: 2rem; margin-bottom: 24px; }
+h1 { margin: 4px 0 0; font-size: clamp(1.6rem, 4vw, 2.6rem); }
+h2 { margin: 0 0 16px; font-size: 1.15rem; }
+.eyebrow { margin: 0; color: #8faed4; text-transform: uppercase; letter-spacing: .11em; font-size: .75rem; }
+.wallet-controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }
+.wallet-address, .muted, footer { color: #a9b5c5; font-size: .88rem; }
+.notice { padding: 12px 14px; border-left: 3px solid #75a6de; background: #1a2635; }
+.error { padding: 12px 14px; background: #4b2024; border: 1px solid #a95760; border-radius: 8px; }
+.panel { margin: 18px 0; padding: 20px; border: 1px solid #303c4c; border-radius: 12px; background: #171e28; }
+.controls { display: flex; align-items: end; gap: 12px; flex-wrap: wrap; margin: 12px 0; }
+label { display: grid; gap: 6px; min-width: min(420px, 100%); color: #c9d5e4; font-size: .86rem; }
+input, select { width: 100%; min-height: 42px; padding: 8px 10px; border: 1px solid #45556a; border-radius: 7px; background: #0f151d; color: #f1f5fa; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; margin-top: 18px; }
+.value { min-width: 0; padding: 11px; border-radius: 8px; background: #111821; }
+.value span { color: #9eb1c7; font-size: .78rem; }
+pre { max-width: 100%; margin: 8px 0 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: .82rem; }
+footer { padding: 18px 0; }
+.danger-notice { padding: 14px; border: 2px solid #e6a338; border-radius: 8px; background: #382814; color: #ffe0a3; line-height: 1.5; }
+.preview-panel button { background: #653826; border-color: #e6a338; }
+@media (max-width: 700px) { .topbar { align-items: flex-start; flex-direction: column; } .wallet-controls { justify-content: flex-start; } }

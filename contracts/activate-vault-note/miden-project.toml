@@ -1,0 +1,11 @@
+[package]
+name = "activate-vault-note"
+version = "0.1.0"
+
+[lib]
+path = "src/lib.rs"
+kind = "note"
+namespace = "miden:activate-vault-note/miden-activate-vault-note@0.1.0"
+
+[dependencies]
+heirbeat-vault = { path = "../heirbeat-vault" }

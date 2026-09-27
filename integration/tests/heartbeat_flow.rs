@@ -104,6 +104,8 @@ struct Harness {
     script: NoteScript,
     claim_script: NoteScript,
     deposit_script: NoteScript,
+    activation_script: NoteScript,
+    activation_mode: bool,
 }
 
 impl Harness {
@@ -112,6 +114,18 @@ impl Harness {
     }
 
     fn configured(timeout: u32, initial_last: u32) -> Result<Self> {
+        Self::configured_with_activation(timeout, initial_last, false)
+    }
+
+    fn activation_ready() -> Result<Self> {
+        Self::configured_with_activation(10, 0, true)
+    }
+
+    fn configured_with_activation(
+        timeout: u32,
+        initial_last: u32,
+        activation_mode: bool,
+    ) -> Result<Self> {
         let mut builder = MockChain::builder();
         let auth = Auth::BasicAuth {
             auth_scheme: AuthScheme::Falcon512Poseidon2,
@@ -129,6 +143,7 @@ impl Harness {
         let script = NoteScript::from_package(&package("check-in-note")?)?;
         let claim_script = NoteScript::from_package(&package("claim-note")?)?;
         let deposit_script = NoteScript::from_package(&package("deposit-note")?)?;
+        let activation_script = NoteScript::from_package(&package("activate-vault-note")?)?;
         assert_eq!(
             P2idNote::script_root().as_word(),
             Word::new(pinned_p2id::P2ID_ROOT.map(|value| Felt::new(value).unwrap()))
@@ -142,6 +157,15 @@ impl Harness {
         init.insert_value(slot("beneficiary").as_str(), owner_word(beneficiary.id()))?;
         init.insert_value(slot("claimed").as_str(), Word::default())?;
         init.insert_value(
+            slot("activated").as_str(),
+            Word::new([
+                Felt::from(if activation_mode { 0u32 } else { 1u32 }),
+                Felt::ZERO,
+                Felt::ZERO,
+                Felt::ZERO,
+            ]),
+        )?;
+        init.insert_value(
             slot("last_check_in").as_str(),
             Word::from([initial_last, 0, 0, 0]),
         )?;
@@ -150,29 +174,62 @@ impl Harness {
             Word::new([Felt::from(timeout), Felt::ZERO, Felt::ZERO, Felt::ZERO]),
         )?;
         let component = AccountComponent::from_package(&package("heirbeat-vault")?, &init)?;
-        assert_eq!(component.storage_slots().len(), 6);
-        let allowed = BTreeSet::from([script.root(), claim_script.root(), deposit_script.root()]);
+        assert_eq!(component.storage_slots().len(), 7);
+        let heirbeat_roots =
+            BTreeSet::from([script.root(), claim_script.root(), deposit_script.root()]);
+        let mut allowed = heirbeat_roots.clone();
+        if activation_mode {
+            allowed.insert(activation_script.root());
+            allowed.insert(NetworkAccountConfigNote::script_root());
+            allowed.insert(FeeSponsorshipNote::script_root());
+        }
         // MockChain has zero verification fees. Explicit zero note fees preserve
         // the exact inherited amounts without introducing a second asset class.
         let mut policy = BasicConstantFeePolicy::new();
         for root in &allowed {
             policy = policy.with_fee(*root, AssetAmount::ZERO);
         }
+        if activation_mode {
+            policy = policy
+                .with_fee(NetworkAccountConfigNote::script_root(), AssetAmount::ZERO)
+                .with_fee(FeeSponsorshipNote::script_root(), AssetAmount::ZERO);
+        }
         let fee_manager = FeePolicyManager::builder()
             .active_fee_policy(policy.into())
             .fee_faucet_id(miden_protocol::testing::account_id::ACCOUNT_ID_FEE_FAUCET.try_into()?)
             .build();
-        let vault = AccountBuilder::new([42; 32])
+        let account_auth = if activation_mode {
+            AuthNetworkAccount::new(allowed.clone(), fee_manager.clone())?
+        } else {
+            AuthNetworkAccount::custom(allowed.clone(), fee_manager.clone())?
+        };
+        let mut account_builder = AccountBuilder::new([42; 32])
             .account_type(AccountType::Public)
             .with_component(component)
-            // `new` adds configuration/sponsorship notes and an expiration script.
-            // `custom` preserves exactly our three roots and an empty tx allowlist.
-            .with_components(AuthNetworkAccount::custom(allowed, fee_manager)?)
-            .build_existing()?;
-        assert_network(
-            &vault,
-            [script.root(), claim_script.root(), deposit_script.root()],
-        )?;
+            .with_components(account_auth);
+        if activation_mode {
+            account_builder =
+                account_builder.with_components(AccessControl::Ownable2Step { owner: owner.id() });
+        }
+        let vault = account_builder.build_existing()?;
+        if activation_mode {
+            let mut expected = allowed;
+            expected.insert(NetworkAccountConfigNote::script_root());
+            expected.insert(FeeSponsorshipNote::script_root());
+            assert_eq!(
+                NetworkAccountNoteAllowlist::try_from(vault.storage())?.allowed_script_roots(),
+                &expected
+            );
+            assert_eq!(
+                NetworkAccountTxScriptAllowlist::try_from(vault.storage())?.allowed_script_roots(),
+                &BTreeSet::from([ExpirationTransactionScript::script_root()])
+            );
+        } else {
+            assert_network(
+                &vault,
+                [script.root(), claim_script.root(), deposit_script.root()],
+            )?;
+        }
         builder.add_account(vault.clone())?;
         let chain = builder.build()?;
         let h = Self {
@@ -184,6 +241,8 @@ impl Harness {
             script,
             claim_script,
             deposit_script,
+            activation_script,
+            activation_mode,
         };
         assert_eq!(
             h.state()?.storage().get_item(&slot("owner"))?,
@@ -194,6 +253,10 @@ impl Harness {
             owner_word(h.beneficiary.id())
         );
         assert_eq!(scalar(h.state()?, "claimed")?, 0);
+        assert_eq!(
+            scalar(h.state()?, "activated")?,
+            u32::from(!activation_mode)
+        );
         assert_eq!(
             deadline(h.state()?)?,
             u64::from(initial_last) + u64::from(timeout)
@@ -223,6 +286,7 @@ impl Harness {
         let executed = self
             .chain
             .build_transaction(sender)
+            .foreign_accounts([self.chain.get_foreign_account_inputs(self.vault)?])
             .send_notes_script(&script)
             .expected_output_notes(notes.iter().cloned().map(RawOutputNote::Full).collect())
             .build()?
@@ -240,6 +304,29 @@ impl Harness {
         Ok(())
     }
 
+    async fn consume_vault_note(&mut self, sender: AccountId, note: &Note) -> Result<bool> {
+        self.send(sender, &[note.clone()]).await?;
+        let result = self
+            .chain
+            .build_transaction(self.vault)
+            .foreign_accounts([self.chain.get_foreign_account_inputs(sender)?])
+            .authenticated_input_note(note.id())
+            .build()?
+            .execute()
+            .await;
+        match result {
+            Ok(executed) => {
+                self.chain.add_pending_executed_transaction(&executed)?;
+                self.chain.prove_next_block()?;
+                Ok(true)
+            }
+            Err(_) => {
+                self.chain.prove_next_block()?;
+                Ok(false)
+            }
+        }
+    }
+
     fn claim_note(&self, sender: AccountId, serial: u32) -> Result<Note> {
         let mut builder = MockChain::builder();
         let note = NoteBuilder::new(sender, builder.rng_mut())
@@ -249,6 +336,38 @@ impl Harness {
             .build()?;
         assert!(note.assets().is_empty());
         Ok(note)
+    }
+
+    fn activation_note(&self, sender: AccountId, serial: u32) -> Result<Note> {
+        let mut builder = MockChain::builder();
+        Ok(NoteBuilder::new(sender, builder.rng_mut())
+            .serial_number(Word::from([serial, 0, 0, 0]))
+            .tag(NoteTag::with_account_target(self.vault).into())
+            .script(self.activation_script.clone())
+            .attachment(NetworkAccountTarget::new(
+                self.vault,
+                NoteExecutionHint::Always,
+            )?)
+            .build()?)
+    }
+
+    fn config_note(
+        &self,
+        sender: AccountId,
+        serial: u32,
+        config: NetworkAccountConfig,
+    ) -> Result<Note> {
+        Ok(NetworkAccountConfigNote::builder()
+            .sender(sender)
+            .target(self.vault)
+            .config(config)
+            .attachment(NetworkAccountTarget::new(
+                self.vault,
+                NoteExecutionHint::Always,
+            )?)
+            .serial_number(Word::from([serial, 0, 0, 0]))
+            .build()?
+            .into())
     }
 
     fn advance_to(&mut self, reference: u32) -> Result<()> {
@@ -362,6 +481,34 @@ impl Harness {
         Ok(())
     }
 
+    fn assert_current_network(&self, account: &Account) -> Result<()> {
+        if !self.activation_mode {
+            return assert_network(
+                account,
+                [
+                    self.script.root(),
+                    self.claim_script.root(),
+                    self.deposit_script.root(),
+                ],
+            );
+        }
+        let network = NetworkAccount::new(account.clone())?;
+        assert_eq!(
+            network.allowed_notes().allowed_script_roots(),
+            &BTreeSet::from([
+                self.script.root(),
+                self.claim_script.root(),
+                self.deposit_script.root(),
+                FeeSponsorshipNote::script_root(),
+            ])
+        );
+        assert_eq!(
+            network.allowed_tx_scripts().allowed_script_roots(),
+            &BTreeSet::from([ExpirationTransactionScript::script_root()])
+        );
+        Ok(())
+    }
+
     async fn claim(&mut self, note: &Note, reference: u32) -> Result<Note> {
         assert_eq!(
             self.chain.latest_block_header().block_num().as_u32(),
@@ -407,14 +554,7 @@ impl Harness {
             executed.final_account().to_commitment()
         );
         assert!(self.chain.is_note_consumed(&note.nullifier()));
-        assert_network(
-            self.state()?,
-            [
-                self.script.root(),
-                self.claim_script.root(),
-                self.deposit_script.root(),
-            ],
-        )?;
+        self.assert_current_network(self.state()?)?;
         Ok(payout)
     }
 
@@ -436,14 +576,7 @@ impl Harness {
             executed.final_account().to_commitment()
         );
         assert!(self.chain.is_note_consumed(&note.nullifier()));
-        assert_network(
-            self.state()?,
-            [
-                self.script.root(),
-                self.claim_script.root(),
-                self.deposit_script.root(),
-            ],
-        )?;
+        self.assert_current_network(self.state()?)?;
         Ok(reference)
     }
 }
@@ -460,6 +593,200 @@ fn assert_network(account: &Account, roots: [NoteScriptRoot; 3]) -> Result<()> {
             .allowed_script_roots()
             .is_empty()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn security_activation_freezes_network_configuration_and_preserves_vault_flows() -> Result<()>
+{
+    let mut h = Harness::activation_ready()?;
+    let config_root = NetworkAccountConfigNote::script_root();
+    let activation_root = h.activation_script.root();
+    let p2id_root = P2idNote::script_root();
+
+    // Activation itself is owner-authorized and cannot be claimed by another sender.
+    let attacker_activation = h.activation_note(h.attacker.id(), 699)?;
+    let before_attacker_activation = h.state()?.clone();
+    assert!(
+        !h.consume_vault_note(h.attacker.id(), &attacker_activation)
+            .await?
+    );
+    assert_eq!(h.state()?, &before_attacker_activation);
+    assert_eq!(scalar(h.state()?, "activated")?, 0);
+    assert!(!h.chain.is_note_consumed(&attacker_activation.nullifier()));
+
+    // Setup remains configurable before activation: add then remove the bootstrap P2ID root.
+    let add_p2id = h.config_note(
+        h.owner.id(),
+        700,
+        NetworkAccountConfig::AddAllowedNoteScript {
+            script_root: p2id_root,
+        },
+    )?;
+    assert!(h.consume_vault_note(h.owner.id(), &add_p2id).await?);
+    assert!(NetworkAccountNoteAllowlist::try_from(h.state()?.storage())?
+        .allowed_script_roots()
+        .contains(&p2id_root));
+    let remove_p2id = h.config_note(
+        h.owner.id(),
+        701,
+        NetworkAccountConfig::RemoveAllowedNoteScript {
+            script_root: p2id_root,
+        },
+    )?;
+    assert!(h.consume_vault_note(h.owner.id(), &remove_p2id).await?);
+    assert!(
+        !NetworkAccountNoteAllowlist::try_from(h.state()?.storage())?
+            .allowed_script_roots()
+            .contains(&p2id_root)
+    );
+
+    // An owner cannot combine a config update with activation to smuggle a newly allowed root
+    // into the frozen state, regardless of note execution order.
+    let bundled_config = h.config_note(
+        h.owner.id(),
+        740,
+        NetworkAccountConfig::AddAllowedNoteScript {
+            script_root: p2id_root,
+        },
+    )?;
+    let bundled_activation = h.activation_note(h.owner.id(), 741)?;
+    h.send(
+        h.owner.id(),
+        &[bundled_config.clone(), bundled_activation.clone()],
+    )
+    .await?;
+    let before_bundle = h.state()?.clone();
+    let bundled_result = h
+        .chain
+        .build_transaction(h.vault)
+        .foreign_accounts([h.chain.get_foreign_account_inputs(h.owner.id())?])
+        .authenticated_input_note(bundled_config.id())
+        .authenticated_input_note(bundled_activation.id())
+        .build()?
+        .execute()
+        .await;
+    assert!(bundled_result.is_err());
+    h.chain.prove_next_block()?;
+    assert_eq!(h.state()?, &before_bundle);
+    assert_eq!(scalar(h.state()?, "activated")?, 0);
+    assert!(!h.chain.is_note_consumed(&bundled_config.nullifier()));
+    assert!(!h.chain.is_note_consumed(&bundled_activation.nullifier()));
+
+    // Activation is one owner-authorized transaction which freezes its own path and the
+    // standardized configuration-note path at the account-storage allowlist layer.
+    let activation = h.activation_note(h.owner.id(), 702)?;
+    assert_eq!(activation.metadata().sender(), h.owner.id());
+    assert!(h.consume_vault_note(h.owner.id(), &activation).await?);
+    assert_eq!(scalar(h.state()?, "activated")?, 1);
+    assert!(h.chain.is_note_consumed(&activation.nullifier()));
+    let final_roots = BTreeSet::from([
+        h.script.root(),
+        h.claim_script.root(),
+        h.deposit_script.root(),
+        FeeSponsorshipNote::script_root(),
+    ]);
+    assert_eq!(
+        NetworkAccountNoteAllowlist::try_from(h.state()?.storage())?.allowed_script_roots(),
+        &final_roots
+    );
+    assert!(!final_roots.contains(&config_root));
+    assert!(!final_roots.contains(&activation_root));
+    assert!(!final_roots.contains(&p2id_root));
+    assert_eq!(
+        NetworkAccountTxScriptAllowlist::try_from(h.state()?.storage())?.allowed_script_roots(),
+        &BTreeSet::from([ExpirationTransactionScript::script_root()])
+    );
+
+    // Adding a root, removing a required root, and changing tx-script permissions all fail
+    // at network-account input-note authorization. No partial component state is committed.
+    let config_attempts = [
+        h.config_note(
+            h.owner.id(),
+            703,
+            NetworkAccountConfig::AddAllowedNoteScript {
+                script_root: p2id_root,
+            },
+        )?,
+        h.config_note(
+            h.owner.id(),
+            704,
+            NetworkAccountConfig::RemoveAllowedNoteScript {
+                script_root: h.script.root(),
+            },
+        )?,
+        h.config_note(
+            h.owner.id(),
+            705,
+            NetworkAccountConfig::RemoveAllowedTxScript {
+                script_root: ExpirationTransactionScript::script_root(),
+            },
+        )?,
+    ];
+    for (attempt_index, config_note) in config_attempts.iter().enumerate() {
+        let before = h.state()?.clone();
+        assert!(!h.consume_vault_note(h.owner.id(), config_note).await?);
+        assert_eq!(h.state()?, &before, "failed config note must be atomic");
+        assert!(
+            !h.chain.is_note_consumed(&config_note.nullifier()),
+            "failed configuration attempt {attempt_index} was consumed"
+        );
+        assert_eq!(scalar(h.state()?, "activated")?, 1);
+        assert_eq!(
+            h.state()?.storage().get_item(&slot("beneficiary"))?,
+            owner_word(h.beneficiary.id())
+        );
+        assert_eq!(
+            h.state()?.storage().get_item(&slot("asset_faucet"))?,
+            owner_word(FungibleAsset::mock_issuer())
+        );
+        assert_eq!(scalar(h.state()?, "timeout_blocks")?, 10);
+        assert_eq!(
+            NetworkAccountNoteAllowlist::try_from(h.state()?.storage())?.allowed_script_roots(),
+            &final_roots
+        );
+    }
+
+    let second_activation = h.activation_note(h.owner.id(), 706)?;
+    let before_second_activation = h.state()?.clone();
+    assert!(
+        !h.consume_vault_note(h.owner.id(), &second_activation)
+            .await?
+    );
+    assert_eq!(h.state()?, &before_second_activation);
+    assert!(!h.chain.is_note_consumed(&second_activation.nullifier()));
+    assert_eq!(scalar(h.state()?, "activated")?, 1);
+
+    // The ordinary Heirbeat paths remain live after freeze: deposit, owner heartbeat, and
+    // beneficiary claim at the exact deadline.
+    h.fund(h.owner.id(), 40, 707).await?;
+    let heartbeat = h.note(h.owner.id(), 708)?;
+    h.send(h.owner.id(), &[heartbeat.clone()]).await?;
+    let last_check_in = h.check_in(&heartbeat).await?;
+    let deadline = u64::from(last_check_in) + u64::from(TIMEOUT);
+    let claim = h.claim_note(h.beneficiary.id(), 709)?;
+    h.send(h.beneficiary.id(), &[claim.clone()]).await?;
+    h.advance_to(u32::try_from(deadline)? as u32)?;
+    let claim_reference = h.chain.latest_block_header().block_num().as_u32();
+    let payout = h.claim(&claim, claim_reference).await?;
+    assert_eq!(scalar(h.state()?, "activated")?, 1);
+    assert_eq!(scalar(h.state()?, "claimed")?, 1);
+    assert_eq!(scalar(h.state()?, "last_check_in")?, last_check_in);
+    assert_eq!(
+        h.state()?.storage().get_item(&slot("beneficiary"))?,
+        owner_word(h.beneficiary.id())
+    );
+    assert_eq!(
+        h.state()?.storage().get_item(&slot("asset_faucet"))?,
+        owner_word(FungibleAsset::mock_issuer())
+    );
+    assert_eq!(scalar(h.state()?, "timeout_blocks")?, 10);
+    assert_eq!(balance(h.state()?), 0);
+    assert_eq!(
+        payout.assets().iter().copied().collect::<Vec<_>>(),
+        vec![supported(40)]
+    );
+    assert!(h.assert_current_network(h.state()?).is_ok());
     Ok(())
 }
 
@@ -1115,6 +1442,10 @@ async fn fee_sponsorship_bootstraps_empty_network_account() -> Result<()> {
     init.insert_value(slot("owner").as_str(), owner_word(owner.id()))?;
     init.insert_value(slot("beneficiary").as_str(), owner_word(beneficiary.id()))?;
     init.insert_value(slot("claimed").as_str(), Word::default())?;
+    init.insert_value(
+        slot("activated").as_str(),
+        Word::new([Felt::from(1u32), Felt::ZERO, Felt::ZERO, Felt::ZERO]),
+    )?;
     init.insert_value(slot("last_check_in").as_str(), Word::default())?;
     init.insert_value(
         slot("timeout_blocks").as_str(),

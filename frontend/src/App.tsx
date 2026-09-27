@@ -29,24 +29,37 @@ export function App() {
   const [nativeFeeFaucet, setNativeFeeFaucet] = useState<string | null>(null);
   const [snapshot, setSnapshot] = useState<VaultSnapshot | null>(null);
   const [featureKind, setFeatureKind] = useState<FeatureKind>("heartbeat");
-  const [noteId, setNoteId] = useState("");
+  const [noteId, setNoteId] = useState("0x09fa485089bbabe66442911374d4abbb48afbb6410fa39ad20bb62229ff16b00");
+  const [ntxResult, setNtxResult] = useState("not queried");
+  const [ntxError, setNtxError] = useState<string | null>(null);
   const [diagnostic, setDiagnostic] = useState<unknown>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [networkState, setNetworkState] = useState("not initialized");
+  const [networkError, setNetworkError] = useState<string | null>(null);
+  const [vaultError, setVaultError] = useState<string | null>(null);
+  const [walletError, setWalletError] = useState<string | null>(null);
   const clientStoreKey = useMemo(() => `heirbeat-browser-spike-${new URL(endpoint).host}`, [endpoint]);
 
-  async function run<T>(task: () => Promise<T>, onSuccess: (result: T) => void) {
+  async function run<T>(task: () => Promise<T>, onSuccess: (result: T) => void, onError?: (message: string) => void) {
     setBusy(true);
     setError(null);
     try { onSuccess(await task()); }
-    catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+    catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setError(message);
+      onError?.(message);
+    }
     finally { setBusy(false); }
   }
 
   async function connectWallet() {
+    setWalletError(null);
     const detected = wallet.wallets.find((candidate) => candidate.readyState === WalletReadyState.Installed || candidate.readyState === WalletReadyState.Loadable);
     if (!detected) {
-      setError("No supported Miden wallet was detected. Install/enable the official Miden Wallet and retry.");
+      const message = "No supported Miden wallet was detected. Install/enable the official Miden Wallet and retry.";
+      setWalletError(message);
+      setError(message);
       return;
     }
     wallet.select(detected.adapter.name);
@@ -54,28 +67,37 @@ export function App() {
       await wallet.connect(PrivateDataPermission.UponRequest, WalletAdapterNetwork.Testnet);
       setError(null);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setWalletError(message);
+      setError(message);
     }
   }
 
   async function connectClient() {
+    setNetworkState("initializing and syncing");
+    setNetworkError(null);
     await run(async () => {
       const created = await createReadOnlyClient(endpoint);
       const syncedBlock = await created.getSyncHeight();
-      const header = await getBlockHeader(created, syncedBlock);
+      const header = await getBlockHeader(endpoint, syncedBlock);
       return { created, syncedBlock, feeFaucet: header.feeFaucetId().toString(), baseFee: header.verificationBaseFee() };
     }, ({ created, syncedBlock, feeFaucet, baseFee }) => {
       client?.terminate();
       setClient(created);
       setBlock(syncedBlock);
       setNativeFeeFaucet(feeFaucet);
+      setNetworkState("synced");
       setSnapshot(null);
       setDiagnostic({ endpoint, syncedBlock, nativeFeeFaucet: feeFaucet, verificationBaseFee: baseFee, store: clientStoreKey });
+    }, (message) => {
+      setNetworkState("failed");
+      setNetworkError(message);
     });
   }
 
   async function loadVault() {
     if (!client) return setError("Connect and sync the browser client first.");
+    setVaultError(null);
     await run(async () => {
       const syncedBlock = await client.getSyncHeight();
       if (!nativeFeeFaucet) throw new Error("Sync a block header before reading native fee balance.");
@@ -85,7 +107,7 @@ export function App() {
       setSnapshot(result);
       setBlock(syncedBlock);
       setDiagnostic({ account: result.accountId, block: syncedBlock, lifecycle: deriveLifecycle(result) });
-    });
+    }, setVaultError);
   }
 
   async function constructNotes() {
@@ -123,11 +145,20 @@ export function App() {
 
   async function checkNtx() {
     if (!client || !noteId) return setError("Connect the client and enter a committed network-note ID.");
-    await run(() => readNtxStatus(client, noteId), (status) => setDiagnostic({ noteId, status: status.status, attemptCount: status.attemptCount, lastAttemptBlockNum: status.lastAttemptBlockNum, lastError: status.lastError }));
+    setNtxError(null);
+    await run(() => readNtxStatus(client, noteId), (status) => {
+      const result = `${status.status} (attempts: ${status.attemptCount}, last block: ${status.lastAttemptBlockNum})`;
+      setNtxResult(result);
+      setDiagnostic({ noteId, status: status.status, attemptCount: status.attemptCount, lastAttemptBlockNum: status.lastAttemptBlockNum, lastError: status.lastError });
+    }, (message) => {
+      setNtxResult("query failed");
+      setNtxError(message);
+    });
   }
 
   const derived = snapshot ? { ...deriveLifecycle(snapshot), role: deriveRole(wallet.address, snapshot.owner, snapshot.beneficiary) } : null;
   const detection = wallet.wallets[0]?.readyState ?? WalletReadyState.Unsupported;
+  const walletDetected = wallet.wallets.some((candidate) => candidate.readyState === WalletReadyState.Installed || candidate.readyState === WalletReadyState.Loadable);
 
   return (
     <main className="shell">
@@ -144,6 +175,13 @@ export function App() {
 
       <section className="panel">
         <h2>Browser client and explicit vault read</h2>
+        <div className="grid">
+          <Value name="RPC endpoint" value={endpoint} />
+          <Value name="Miden Web SDK runtime" value={client ? "loaded; client initialized" : "loaded; client not initialized"} />
+          <Value name="IndexedDB API / client store" value={`${typeof indexedDB === "undefined" ? "unavailable" : "available"} / ${client ? "initialized" : "not initialized"}`} />
+          <Value name="Sync state / reference block" value={`${networkState} / ${block ?? "unavailable"}`} />
+          <Value name="Last network error" value={networkError ?? "none"} />
+        </div>
         <div className="controls">
           <label>Testnet RPC<select value={endpoint} onChange={(event) => setEndpoint(event.target.value)}>{TESTNET_ENDPOINTS.map((url) => <option key={url}>{url}</option>)}</select></label>
           <button onClick={connectClient} disabled={busy}>{busy ? "Working…" : "Initialize + sync chain"}</button>
@@ -165,6 +203,18 @@ export function App() {
           <Value name="Note roots" value={snapshot.noteAllowlist.join("\n")} />
           <Value name="Transaction-script roots" value={snapshot.transactionScriptAllowlist.join("\n")} />
         </div>}
+        <Value name="Vault read error" value={vaultError ?? "none"} />
+      </section>
+
+      <section className="panel">
+        <h2>Wallet and adapter runtime</h2>
+        <div className="grid">
+          <Value name="Wallet adapter context" value="initialized" />
+          <Value name="Wallet detected / readiness" value={`${walletDetected} / ${detection}`} />
+          <Value name="Connection state" value={wallet.connected ? "connected" : "disconnected"} />
+          <Value name="Connected AccountId" value={wallet.address ?? "none"} />
+          <Value name="Last wallet error" value={walletError ?? "none"} />
+        </div>
       </section>
 
       <section className="panel">
@@ -180,6 +230,22 @@ export function App() {
         <h2>NTX status probe</h2>
         <p className="muted">Read-only GetNetworkNoteStatus via the Web SDK’s internal raw-client bridge; this is not a stable high-level React API.</p>
         <div className="controls"><label>Committed note ID<input value={noteId} onChange={(event) => setNoteId(event.target.value)} placeholder="0x…" /></label><button onClick={checkNtx} disabled={!client || busy}>Query status</button></div>
+      </section>
+
+      <section className="panel">
+        <h2>Browser capability status</h2>
+        <div className="grid">
+          <Value name="Heartbeat note construction" value="available locally; select and validate above" />
+          <Value name="Deposit note construction" value="available locally; select and validate above" />
+          <Value name="Claim note construction" value="available locally; select and validate above" />
+          <Value name="Activation note construction" value="available locally; select and validate above" />
+          <Value name="FeeSponsorship pairing" value="built and paired by local feature-note constructor" />
+          <Value name="NetworkAccountTarget" value="included by local feature-note constructor" />
+          <Value name="NTX status" value="internal Web SDK bridge; query above" />
+          <Value name="P2ID consume request" value="local validated-note helper available; wallet handoff not implemented in this diagnostic page" />
+          <Value name="Transaction submission" value="disabled; no wallet request is sent" />
+          <Value name="NTX result / last error" value={`${ntxResult} / ${ntxError ?? "none"}`} />
+        </div>
       </section>
 
       {diagnostic !== null && <section className="panel"><h2>Diagnostic output</h2><pre>{pretty(diagnostic)}</pre></section>}

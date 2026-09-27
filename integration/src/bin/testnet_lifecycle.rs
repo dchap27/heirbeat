@@ -11,7 +11,7 @@ use integration::testnet::{
     config::{TestnetConfig, DEFAULT_RPC_ENDPOINT},
     fees::{
         build_network_sponsorship, build_wallet_fee_note, ensure_sponsorship_pair,
-        DEFAULT_NETWORK_SPONSORSHIP_AMOUNT,
+        ensure_sufficient_native_for_sponsorship, DEFAULT_NETWORK_SPONSORSHIP_AMOUNT,
     },
     notes::{assert_network_target, network_target},
     polling::PollPolicy,
@@ -236,6 +236,8 @@ async fn verify_durable_faucet(faucet_id: AccountId, expected_max_supply: u64) -
 async fn deploy_durable_faucet(faucet_id: AccountId, owner: AccountId) -> Result<(String, String)> {
     let mut client = client().await?;
     client.sync_state().await?;
+    let rpc = VerifyingRpcClient::new(GrpcClient::new(&Endpoint::testnet(), 10_000));
+    let (header, _) = rpc.get_block_header_by_number(None, false).await?;
     let fee_faucet = parse_id(FEE_FAUCET)?;
     let keys = FilesystemKeyStore::new(state_dir().join(".miden/keystore"))?;
     ensure!(
@@ -253,11 +255,6 @@ async fn deploy_durable_faucet(faucet_id: AccountId, owner: AccountId) -> Result
     let owner_fee_balance = owner_account
         .vault()
         .get_balance(FungibleAsset::new(fee_faucet, 1)?.id())?;
-    ensure!(
-        owner_fee_balance.as_u64() >= 151,
-        "owner native fee balance is too low for paired faucet bootstrap: {owner_fee_balance}"
-    );
-
     let mut rng = rng();
     let feature_note: Note = P2idNote::builder()
         .sender(owner)
@@ -268,6 +265,14 @@ async fn deploy_durable_faucet(faucet_id: AccountId, owner: AccountId) -> Result
         .build()?
         .into();
     let sponsorship_amount = 150u64;
+    ensure_sufficient_native_for_sponsorship(
+        "Owner",
+        "faucet bootstrap",
+        owner_fee_balance.as_u64(),
+        sponsorship_amount,
+        header.fee_parameters().verification_base_fee(),
+        1,
+    )?;
     let sponsorship_note: Note = FeeSponsorshipNote::builder()
         .sender(owner)
         .target_account(faucet_id)
@@ -1124,6 +1129,8 @@ async fn create_vault(
 ) -> Result<AccountId> {
     let mut client = client().await?;
     client.sync_state().await?;
+    let fee_rpc = VerifyingRpcClient::new(GrpcClient::new(&Endpoint::testnet(), 10_000));
+    let (fee_header, _) = fee_rpc.get_block_header_by_number(None, false).await?;
 
     let check_in = NoteScript::from_package(&package("check-in-note")?)?;
     let claim = NoteScript::from_package(&package("claim-note")?)?;
@@ -1219,6 +1226,21 @@ async fn create_vault(
         .generate_serial_number(&mut rng)
         .build()?
         .into();
+    let owner_account = client
+        .get_account(owner)
+        .await?
+        .context("owner wallet is not tracked for vault bootstrap")?;
+    let owner_native = owner_account
+        .vault()
+        .get_balance(FungibleAsset::new(fee_faucet, 1)?.id())?;
+    ensure_sufficient_native_for_sponsorship(
+        "Owner",
+        "vault bootstrap",
+        owner_native.as_u64(),
+        sponsorship_amount,
+        fee_header.fee_parameters().verification_base_fee(),
+        1,
+    )?;
     let bootstrap_p2id_note_id = feature_note.id();
     config.public_ids.insert(
         "vault_bootstrap_p2id_note".into(),
@@ -1610,6 +1632,10 @@ async fn remove_bootstrap_p2id(
     let fee_before = vault
         .vault()
         .get_balance(FungibleAsset::new(fee_asset, 1)?.id())?;
+    let owner_account = client
+        .get_account(owner)
+        .await?
+        .context("owner wallet is not tracked for config cleanup")?;
     ensure!(
         inherited_before == AssetAmount::ZERO,
         "inherited asset balance is not zero"
@@ -1649,6 +1675,17 @@ async fn remove_bootstrap_p2id(
     assert_network_target(&config_note, vault_id)?;
     let config_note_id = config_note.id();
     let sponsorship_amount = 120u64;
+    ensure_sufficient_native_for_sponsorship(
+        "Owner",
+        "configuration",
+        owner_account
+            .vault()
+            .get_balance(FungibleAsset::new(fee_asset, 1)?.id())?
+            .as_u64(),
+        sponsorship_amount,
+        header.fee_parameters().verification_base_fee(),
+        0,
+    )?;
     let sponsorship_note: Note = FeeSponsorshipNote::builder()
         .sender(owner)
         .target_account(vault_id)
@@ -1780,6 +1817,8 @@ async fn activate_vault(
 ) -> Result<(String, String, String, String)> {
     let mut client = client().await?;
     client.sync_state().await?;
+    let fee_rpc = VerifyingRpcClient::new(GrpcClient::new(&Endpoint::testnet(), 10_000));
+    let (fee_header, _) = fee_rpc.get_block_header_by_number(None, false).await?;
     let vault = client
         .get_account(vault_id)
         .await?
@@ -1861,6 +1900,21 @@ async fn activate_vault(
         .build()?
         .into();
     let sponsorship_id = sponsorship_note.id();
+    let owner_account = client
+        .get_account(owner)
+        .await?
+        .context("owner wallet is not tracked for activation")?;
+    let owner_native = owner_account
+        .vault()
+        .get_balance(FungibleAsset::new(fee_faucet, 1)?.id())?;
+    ensure_sufficient_native_for_sponsorship(
+        "Owner",
+        "activation",
+        owner_native.as_u64(),
+        sponsorship_amount,
+        fee_header.fee_parameters().verification_base_fee(),
+        0,
+    )?;
     let owner_tx = client
         .submit_new_transaction(
             owner,
@@ -2264,7 +2318,19 @@ async fn submit_feature_command(
     let native_balance = sender_account
         .vault()
         .get_balance(FungibleAsset::new(fee_faucet, 1)?.id())?;
-    ensure!(native_balance >= AssetAmount::from(header.fee_parameters().verification_base_fee()), "wallet native fee balance is below the current base fee; use fund-fees with a normal P2ID note");
+    let account_label = if kind == "claim" {
+        "Beneficiary"
+    } else {
+        "Owner"
+    };
+    ensure_sufficient_native_for_sponsorship(
+        account_label,
+        kind,
+        native_balance.as_u64(),
+        DEFAULT_NETWORK_SPONSORSHIP_AMOUNT,
+        header.fee_parameters().verification_base_fee(),
+        0,
+    )?;
     let funding_request = TransactionRequestBuilder::new()
         .own_output_notes([feature_note.clone(), sponsorship_note.clone()])
         .expected_ntx_scripts(vec![script.clone(), FeeSponsorshipNote::script()])

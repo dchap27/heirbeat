@@ -1,4 +1,4 @@
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use miden_client::account::AccountId;
 use miden_protocol::{
     asset::FungibleAsset,
@@ -8,6 +8,53 @@ use miden_protocol::{
 use miden_standards::note::{FeeSponsorshipNote, FeeSponsorshipNoteStorage, P2idNote};
 
 pub const DEFAULT_NETWORK_SPONSORSHIP_AMOUNT: u64 = 150;
+
+/// The CLI's existing conservative reserve for an ordinary wallet transaction, expressed as
+/// verification-base-fee units (also used by the payout-consumption preflight).
+pub const WALLET_FEE_RESERVE_UNITS: u64 = 17;
+
+/// Estimates the wallet transaction fee using the current verification base fee and the
+/// conservative reserve already used by the CLI for normal-wallet transactions.
+pub fn estimated_wallet_transaction_fee(verification_base_fee: u32) -> Result<u64> {
+    u64::from(verification_base_fee)
+        .checked_mul(WALLET_FEE_RESERVE_UNITS)
+        .context("estimated wallet transaction fee overflowed")
+}
+
+/// Returns the native balance required to fund a sponsorship note, the ordinary wallet
+/// transaction fee reserve, and any additional native assets sent in the same transaction.
+pub fn required_native_for_sponsorship(
+    sponsorship_amount: u64,
+    verification_base_fee: u32,
+    other_native_outputs: u64,
+) -> Result<u64> {
+    sponsorship_amount
+        .checked_add(estimated_wallet_transaction_fee(verification_base_fee)?)
+        .and_then(|amount| amount.checked_add(other_native_outputs))
+        .context("required native balance for sponsorship overflowed")
+}
+
+/// Fails before submission when a normal wallet cannot fund both sponsorship and its own
+/// transaction reserve. `account_label` and `operation` keep the user-facing error actionable.
+pub fn ensure_sufficient_native_for_sponsorship(
+    account_label: &str,
+    operation: &str,
+    available: u64,
+    sponsorship_amount: u64,
+    verification_base_fee: u32,
+    other_native_outputs: u64,
+) -> Result<()> {
+    let required = required_native_for_sponsorship(
+        sponsorship_amount,
+        verification_base_fee,
+        other_native_outputs,
+    )?;
+    ensure!(
+        available >= required,
+        "{account_label} has insufficient native fee balance for {operation} sponsorship. Required: {required}, available: {available}. Fund the {account_label} wallet and retry."
+    );
+    Ok(())
+}
 
 /// Builds a normal wallet P2ID fee transfer. This is used for wallet/faucet fee liquidity;
 /// Network Account execution instead uses a feature-note-paired `FeeSponsorshipNote`.
@@ -65,6 +112,56 @@ pub fn ensure_sponsorship_pair(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sponsorship_preflight_rejects_balance_below_sponsorship_amount() {
+        let error =
+            ensure_sufficient_native_for_sponsorship("Beneficiary", "claim", 149, 150, 7, 0)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("Beneficiary has insufficient native fee balance"));
+        assert!(error.contains("claim sponsorship"));
+        assert!(error.contains("Required: 269, available: 149"));
+        assert!(error.contains("Fund the Beneficiary wallet and retry"));
+    }
+
+    #[test]
+    fn sponsorship_preflight_rejects_exact_sponsorship_without_fee_reserve() {
+        let error =
+            ensure_sufficient_native_for_sponsorship("Beneficiary", "claim", 150, 150, 7, 0)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("Required: 269, available: 150"));
+    }
+
+    #[test]
+    fn sponsorship_preflight_accepts_exact_required_balance_and_above() {
+        let required = required_native_for_sponsorship(150, 7, 0).unwrap();
+        assert_eq!(required, 269);
+        assert!(ensure_sufficient_native_for_sponsorship(
+            "Beneficiary",
+            "claim",
+            required,
+            150,
+            7,
+            0,
+        )
+        .is_ok());
+        assert!(ensure_sufficient_native_for_sponsorship(
+            "Beneficiary",
+            "claim",
+            required + 1,
+            150,
+            7,
+            0,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn sponsorship_preflight_includes_other_native_outputs() {
+        assert_eq!(required_native_for_sponsorship(150, 7, 1).unwrap(), 270);
+    }
 
     #[test]
     fn rejects_invalid_or_mismatched_sponsorship_metadata() {

@@ -8,9 +8,11 @@ The live lifecycle completed on the Miden v0.16 public testnet (`https://rpc.tes
 
 Public evidence: deposit funding transaction `0xcc74cf283012db4bcb2d2c8a51ca65aa98799b95fe2cb933d060c30730f5fa9c`, deposit note `0x6c55c4c1ee74b846a1cb468b2d1cc37790ed8cc4c189d29a7b8600c72eb74beb`; heartbeat funding transaction `0xc8f5ac51141b85884bde037ab6e82fc126b081b91ea9f98045fcfd2d34893bdf`, note `0x92da7ad5fad0defb64bf847dc49f7320b443bbcbeb1d4f71a9fadc318254f680`; claim funding transaction `0x63c579af38e75eaa466bf38437d724b370a18a3396564d6f6e3c52ad8627fb68`, claim note `0x9a432906999582825c1e15d69f53312a6f8e84c8787bb26029ffcba850cc852d`, vault claim transaction `0xd3fac87bb0cbce14fd4d09d08425d3e34173f629571f21b043f35c765041c478`; payout note `0xf5d28de2a49084c4d7126b3701e0024fc4747d0b5e63ef79e05cc8e6385294e0`, consumed by transaction `0xdc525ae744a532051ca3fefe78a348db875347d3cf2d57204c6929917bac86eb`. Final HBTESTV accounting is owner `10` + beneficiary `100` + vault `0` + the untouched malformed committed note `100` = faucet supply `210`. This is an early testnet protocol run, not a production deployment. No secrets are included.
 
+The activation freeze described below is a new local protocol revision. The public-testnet lifecycle above predates this change; that existing account was not modified or reconfigured in this sprint.
+
 ## State and custody
 
-Six named value slots under `heirbeat_vault::heirbeat_vault`:
+Seven named value slots under `heirbeat_vault::heirbeat_vault`:
 
 | Slot | Encoding | Initial value |
 | --- | --- | --- |
@@ -20,10 +22,13 @@ Six named value slots under `heirbeat_vault::heirbeat_vault`:
 | `last_check_in` | Felt in `[value, 0, 0, 0]` | `0` by default |
 | `timeout_blocks` | Felt containing a validated `u32` | Configured timeout |
 | `claimed` | Felt: `0` false, `1` true | `0` |
+| `activated` | Felt: `0` setup, `1` immutable configuration | `0` |
+
+Vault procedures that mutate inheritance state are disabled before activation. An owner-sent `activate-vault-note` atomically sets `activated=1` and clears the NetworkAccountConfig and activation roots from AuthNetworkAccount's note-allowlist map. After activation only check-in, claim, deposit, and FeeSponsorship note roots remain; the transaction-script allowlist remains expiration-only. The config root is removed at the account level, so standard owner-authorized configuration notes can no longer alter the vault or its execution surface. Activation also requires bootstrap P2ID to be absent and cannot be combined with config or unrelated notes.
 
 Assets reside in Miden's native account vault, separately from component storage. Only the configured faucet's fungible asset **with callbacks disabled** is supported. Other faucets, callback-enabled assets, and NFTs are rejected by exact asset-key comparison. There is no inheritance amount or percentage allocation.
 
-`check_in()` requires `claimed == 0` and `active_note::get_sender()` equal to the stored owner. It records `tx::get_block_number()` and rejects older reference heights.
+`check_in()` requires activation, `claimed == 0`, and `active_note::get_sender()` equal to the stored owner. After activation, the owner's privileged authority is limited to heartbeat timing; deposit notes retain their existing supported-asset policy and do not alter inheritance policy or heartbeat state.
 
 `deadline = last_check_in + timeout_blocks`. Eligibility is derived, never stored. The block API means the **transaction reference block**, not the later commitment block. Both deadline operands are validated as `u32` and widened to `u64` before addition; the maximum sum is `8_589_934_590`, without wrapping. Initialization to zero remains temporary pending finalized vault-creation semantics.
 
@@ -35,7 +40,7 @@ CLAIMED is terminal: further claims, heartbeats, and deposits fail. A zero-balan
 
 ## Notes and authorization
 
-The vault uses `AccountType::Public` and `AuthNetworkAccount::with_allowed_notes` containing the three Heirbeat roots: `check-in-note`, `claim-note`, and `deposit-note`. The live v0.16 Network Account additionally retains the required `NetworkAccountConfig` and `FeeSponsorship` roots; its P2ID input root is absent. Its transaction-script allowlist contains only the canonical expiration root. Payout P2ID notes are consumed by the beneficiary wallet, not by the vault.
+The vault uses `AccountType::Public` and `AuthNetworkAccount` with setup roots for the three Heirbeat notes, `activate-vault-note`, `NetworkAccountConfig`, and `FeeSponsorship`; P2ID is temporary during bootstrap only. Activation removes the config and activation roots. The final input allowlist is exactly `check-in-note`, `claim-note`, `deposit-note`, and `FeeSponsorship`; P2ID and `NetworkAccountConfig` are absent. Its transaction-script allowlist contains only the canonical expiration root. Payout P2ID notes are consumed by the beneficiary wallet, not by the vault.
 
 Check-in and claim notes carry no assets or storage arguments. Deposit notes carry assets and two recipient Felts `[suffix, prefix]`. Each invokes its corresponding compiled vault procedure through FPI.
 
@@ -50,6 +55,7 @@ Use the Miden v0.16.0 toolchain binaries on `PATH`. Build from each contract dir
 ```bash
 export PATH="$HOME/.local/share/midenup/toolchains/0.16.0/bin:$PATH"
 (cd contracts/heirbeat-vault && cargo miden build --release)
+(cd contracts/activate-vault-note && cargo miden build --release)
 (cd contracts/check-in-note && cargo miden build --release)
 (cd contracts/claim-note && cargo miden build --release)
 (cd contracts/deposit-note && cargo miden build --release)

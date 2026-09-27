@@ -1,6 +1,6 @@
 # Heirbeat Security Findings
 
-Assessment scope: source and local test review on `sprint7-security-hardening`; no live-testnet mutation or protocol redesign. Findings distinguish code defects from accepted key custody and infrastructure assumptions.
+Assessment scope: source and local test review on `sprint7-1-config-freeze`; no live-testnet mutation or protocol redesign. Findings distinguish code defects from accepted key custody and infrastructure assumptions.
 
 ## Findings
 
@@ -13,8 +13,8 @@ Assessment scope: source and local test review on `sprint7-security-hardening`; 
 - **Exploit scenario:** An interrupted `deploy-vault` has persisted a pending vault with P2ID still input-allowlisted. A rerun sees the bootstrap roots as valid and writes the vault ID as complete, leaving the extra public input script enabled.
 - **Impact:** Broadens the Network Account's note execution surface beyond the required final policy.
 - **Evidence/test:** Found by source review of `verify_vault` and its `finalized` check. The CLI now shares an exact hardened allowlist validator, which rejects missing roots, extra roots, P2ID, and transaction-script broadening.
-- **Mitigation:** Deployment completion now requires exactly check-in, claim, deposit, NetworkAccountConfig, and FeeSponsorship note roots plus exactly the canonical expiration transaction-script root. Bootstrap P2ID is rejected as a final state.
-- **Residual risk:** Deployment cleanup remains a live external transaction; a failed cleanup leaves deployment incomplete and CLI config does not mark the vault active.
+- **Mitigation:** Deployment completion now requires `activated == 1`, exactly check-in, claim, deposit, and FeeSponsorship note roots, and exactly the canonical expiration transaction-script root. Bootstrap P2ID and NetworkAccountConfig are absent from the activated state.
+- **Residual risk:** Bootstrap cleanup and activation are live external transactions; failure leaves deployment incomplete and the CLI does not report the vault as finalized.
 
 ### S7-02 — Compromised owner can keep an active vault ineligible
 
@@ -28,17 +28,17 @@ Assessment scope: source and local test review on `sprint7-security-hardening`; 
 - **Mitigation:** No mitigation exists in the current protocol. Keep owner keys strongly protected and disclose this limitation to vault creators/beneficiaries.
 - **Residual risk:** Protocol-level recovery/rotation would change governance semantics and requires architectural review before production; no new mechanism is introduced here.
 
-### S7-03 — Owner-authorized Network Account configuration can change the accepted surface
+### S7-03 — Owner-authorized Network Account configuration was mutable after deployment
 
 - **Severity:** HIGH
-- **Status:** OPEN
+- **Status:** MITIGATED
 - **Affected component:** v0.16 `NetworkAccountConfigNote` and account access-control policy
-- **Description:** The standardized config-note procedure can update note/transaction-script allowlists when authorized by the account's configured access-control component. This is a governance capability, not immutable Heirbeat policy. An authorized owner can add P2ID or remove a Heirbeat/system root.
-- **Exploit scenario:** An owner key holder issues an authorized config note that broadens accepted roots, or an attacker with the owner key does so.
-- **Impact:** The configured execution surface changes; adding a malicious script could create an authorization path outside the reviewed Heirbeat procedures.
-- **Evidence/test:** `security` coverage in `fee_sponsorship_bootstraps_empty_network_account` proves a beneficiary-sent config note is rejected, while the configured owner can remove/re-add P2ID, a Heirbeat root, and the expiration transaction-script root, and can remove the config/sponsorship roots. Exact local allowlist checks reject unexpected state before CLI feature operations.
-- **Mitigation:** Owner authorization, exact hardened-state validation in CLI preflight, and public state verification.
-- **Residual risk:** CLI validation cannot stop an owner-authorized config update or constrain the standard component on-chain. Making roots immutable or changing governance requires architectural review.
+- **Description:** Before this sprint, the standard `NetworkAccountConfigNote` root remained allowed after deployment, so the owner could continue changing note roots, transaction-script roots, and fee-policy roots. The v0.16 config script calls `AuthNetworkAccount` mutation procedures gated by account-wide Authority.
+- **Exploit scenario:** An owner key holder, or an attacker with that key, submits an authorized config note after the vault was considered live and changes the accepted execution surface.
+- **Impact:** Could add an unreviewed execution path or remove required Heirbeat paths.
+- **Evidence/test:** Stable v0.16 `network_account_config.masm` and `network_account.masm` source inspected. New MockChain activation coverage proves setup config works before activation, activation consumes exactly once, post-activation add/remove note roots and tx-script changes are rejected, state is atomic, and heartbeat/claim still succeed.
+- **Mitigation:** The immutable vault activation procedure checks owner sender, unclaimed/unactivated state, P2ID absence, and activation input-note composition. It atomically sets `activated=1` and writes empty values to the NetworkAccountConfig and activation roots in AuthNetworkAccount's note-allowlist map. AuthNetworkAccount uses initial storage for its allowlist check, so activation finishes while later config-note transactions fail before script execution. The CLI requires the exact pre-activation roots and expiration-only tx script before activation.
+- **Residual risk:** Miden exposes no in-component enumeration for arbitrary map entries. The component enforces removal of the config path and P2ID absence; the CLI checks the complete exact pre-activation set. A raw owner bypassing the CLI can create extra roots before activation and then freeze them in place. This is a setup trust boundary, not post-activation config authority.
 
 ### S7-04 — Local keystore compromise or loss compromises account authority
 
@@ -115,9 +115,9 @@ Assessment scope: source and local test review on `sprint7-security-hardening`; 
 ## Severity summary
 
 - **Critical:** 1 open key-compromise risk (S7-04); protocol attack paths for forged sender, unauthorized claim, unsupported asset, replay, and payout substitution are mitigated by existing tests/invariants.
-- **High:** 3 open architectural/operational risks (S7-02 owner compromise, S7-03 config governance, S7-05 NTX censorship) plus S7-01 mitigated.
+- **High:** 2 open architectural/operational risks (S7-02 owner compromise and S7-05 NTX censorship); S7-01 and S7-03 are mitigated.
 - **Medium:** faucet issuance/accounting accepted (S7-07); NTX delay and sponsorship denial/stranding are captured as operational residual risks.
 - **Low:** excess sponsorship recovery open (S7-06); local config handling mitigated (S7-09).
 - **Info:** version graph pinning is mitigated and monitored (S7-08).
 
-No unresolved code defect in the local contract procedures was identified in this sprint. The open HIGH items are explicitly architectural/operational risks and should be reviewed before production deployment.
+S7-03 is mitigated for the MVP activation model: post-activation configuration is blocked at the account's note-authorization layer, not only by CLI checks. Exact setup-state verification remains a CLI precondition because map enumeration is unavailable in the account component. The open HIGH items are explicitly architectural/operational risks and should be reviewed before production deployment.

@@ -800,8 +800,9 @@ async fn verify_config(config: &TestnetConfig, json: bool) -> Result<()> {
         NoteScript::from_package(&package("check-in-note")?)?.root(),
         NoteScript::from_package(&package("claim-note")?)?.root(),
         NoteScript::from_package(&package("deposit-note")?)?.root(),
-        NetworkAccountConfigNote::script_root(),
         FeeSponsorshipNote::script_root(),
+        NetworkAccountConfigNote::script_root(),
+        NoteScript::from_package(&package("activate-vault-note")?)?.root(),
         P2idNote::script_root(),
         ExpirationTransactionScript::script_root(),
     )?;
@@ -817,6 +818,15 @@ async fn verify_config(config: &TestnetConfig, json: bool) -> Result<()> {
         .get_item(&StorageSlotName::new(slot("claimed"))?)?[0]
         .as_canonical_u64()
         != 0;
+    let activated = account
+        .storage()
+        .get_item(&StorageSlotName::new(slot("activated"))?)?[0]
+        .as_canonical_u64()
+        == 1;
+    ensure!(
+        activated,
+        "vault activation is not finalized; configuration remains mutable"
+    );
     let faucet_account = client
         .get_account(faucet_id)
         .await?
@@ -850,6 +860,7 @@ async fn verify_config(config: &TestnetConfig, json: bool) -> Result<()> {
         "beneficiary": beneficiary.to_string(),
         "faucet": faucet_id.to_string(),
         "timeout_blocks": timeout,
+        "activated": activated,
         "claimed": claimed,
         "inherited_balance": inherited_balance.as_u64(),
         "native_fee_balance": native_balance.as_u64(),
@@ -925,14 +936,22 @@ async fn validate_configured_vault_for_mutation(config: &TestnetConfig) -> Resul
         )
         .context("stored timeout exceeds u32 range")?,
     )?;
+    ensure!(
+        vault
+            .storage()
+            .get_item(&StorageSlotName::new(slot("activated"))?)?[0]
+            == Felt::from(1u32),
+        "refusing mutation: vault is not activated/frozen"
+    );
     validate_hardened_allowlists(
         network.allowed_notes().allowed_script_roots(),
         network.allowed_tx_scripts().allowed_script_roots(),
         NoteScript::from_package(&package("check-in-note")?)?.root(),
         NoteScript::from_package(&package("claim-note")?)?.root(),
         NoteScript::from_package(&package("deposit-note")?)?.root(),
-        NetworkAccountConfigNote::script_root(),
         FeeSponsorshipNote::script_root(),
+        NetworkAccountConfigNote::script_root(),
+        NoteScript::from_package(&package("activate-vault-note")?)?.root(),
         P2idNote::script_root(),
         ExpirationTransactionScript::script_root(),
     )?;
@@ -1109,6 +1128,7 @@ async fn create_vault(
     let check_in = NoteScript::from_package(&package("check-in-note")?)?;
     let claim = NoteScript::from_package(&package("claim-note")?)?;
     let deposit = NoteScript::from_package(&package("deposit-note")?)?;
+    let activation = NoteScript::from_package(&package("activate-vault-note")?)?;
     let heirbeat_roots = BTreeSet::from([check_in.root(), claim.root(), deposit.root()]);
     ensure!(
         heirbeat_roots.len() == 3,
@@ -1117,12 +1137,14 @@ async fn create_vault(
     let p2id_root = P2idNote::script_root();
     let mut allowed = heirbeat_roots;
     allowed.insert(p2id_root);
+    allowed.insert(activation.root());
 
     let mut init = InitStorageData::default();
     init.insert_value(slot("owner").as_str(), owner_word(owner))?;
     init.insert_value(slot("beneficiary").as_str(), owner_word(beneficiary))?;
     init.insert_value(slot("asset_faucet").as_str(), owner_word(asset_faucet))?;
     init.insert_value(slot("claimed").as_str(), Word::default())?;
+    init.insert_value(slot("activated").as_str(), Word::default())?;
     init.insert_value(slot("last_check_in").as_str(), Word::default())?;
     init.insert_value(
         slot("timeout_blocks").as_str(),
@@ -1137,6 +1159,7 @@ async fn create_vault(
         .with_fee(config_note_root, AssetAmount::ZERO)
         .with_fee(fee_sponsorship_root, AssetAmount::ZERO)
         .with_fee(p2id_root, AssetAmount::ZERO);
+    policy = policy.with_fee(activation.root(), AssetAmount::ZERO);
     for root in &allowed {
         policy = policy.with_fee(*root, miden_client::asset::AssetAmount::ZERO);
     }
@@ -1406,9 +1429,17 @@ async fn verify_vault(
             == Word::default(),
         "vault last_check_in is not its initial zero value"
     );
+    ensure!(
+        account
+            .storage()
+            .get_item(&StorageSlotName::new(slot("activated"))?)?[0]
+            == Felt::from(1u32),
+        "vault activation is not finalized"
+    );
     let check_in = NoteScript::from_package(&package("check-in-note")?)?.root();
     let claim = NoteScript::from_package(&package("claim-note")?)?.root();
     let deposit = NoteScript::from_package(&package("deposit-note")?)?.root();
+    let activation = NoteScript::from_package(&package("activate-vault-note")?)?.root();
     let p2id = P2idNote::script_root();
     let config = NetworkAccountConfigNote::script_root();
     let sponsorship = FeeSponsorshipNote::script_root();
@@ -1418,8 +1449,9 @@ async fn verify_vault(
         check_in,
         claim,
         deposit,
-        config,
         sponsorship,
+        config,
+        activation,
         p2id,
         ExpirationTransactionScript::script_root(),
     )?;
@@ -1524,10 +1556,19 @@ async fn remove_bootstrap_p2id(
     let check_in = NoteScript::from_package(&package("check-in-note")?)?.root();
     let claim = NoteScript::from_package(&package("claim-note")?)?.root();
     let deposit = NoteScript::from_package(&package("deposit-note")?)?.root();
+    let activation = NoteScript::from_package(&package("activate-vault-note")?)?.root();
     let p2id = P2idNote::script_root();
     let config = NetworkAccountConfigNote::script_root();
     let sponsorship = FeeSponsorshipNote::script_root();
-    let expected_before = BTreeSet::from([check_in, claim, deposit, p2id, config, sponsorship]);
+    let expected_before = BTreeSet::from([
+        check_in,
+        claim,
+        deposit,
+        activation,
+        p2id,
+        config,
+        sponsorship,
+    ]);
     ensure!(
         network_account.allowed_notes().allowed_script_roots() == &expected_before,
         "pre-cleanup note allowlist has unexpected roots: {:?}",
@@ -1647,10 +1688,11 @@ async fn remove_bootstrap_p2id(
         .await?
         .context("vault missing after config-note transaction")?;
     let updated_network = NetworkAccount::new(updated.clone())?;
-    let expected_after = BTreeSet::from([check_in, claim, deposit, config, sponsorship]);
+    let expected_after =
+        BTreeSet::from([check_in, claim, deposit, activation, config, sponsorship]);
     ensure!(
         updated_network.allowed_notes().allowed_script_roots() == &expected_after,
-        "post-cleanup allowlist is not exactly the expected five roots: {:?}",
+        "post-cleanup allowlist is not exactly the expected pre-activation roots: {:?}",
         updated_network.allowed_notes().allowed_script_roots()
     );
     ensure!(
@@ -1712,6 +1754,7 @@ async fn remove_bootstrap_p2id(
         updated_network.allowed_tx_scripts().allowed_script_roots()
     );
     println!("p2id_root={p2id}");
+    println!("activation_root={activation}");
     println!("p2id_rejection=standard P2ID root absent from freshly synced NetworkAccountNoteAllowlist; network-account auth rejects unallowlisted note roots");
     println!("heirbeat_roots_preserved=true");
     println!(
@@ -1724,6 +1767,182 @@ async fn remove_bootstrap_p2id(
         sponsorship_note_id.to_string(),
         owner_tx.to_string(),
         config_tx,
+    ))
+}
+
+async fn activate_vault(
+    vault_id: AccountId,
+    owner: AccountId,
+    beneficiary: AccountId,
+    asset_faucet: AccountId,
+    timeout: u32,
+    policy: PollPolicy,
+) -> Result<(String, String, String, String)> {
+    let mut client = client().await?;
+    client.sync_state().await?;
+    let vault = client
+        .get_account(vault_id)
+        .await?
+        .context("vault is missing before activation")?;
+    let network = NetworkAccount::new(vault.clone())?;
+    let check_in = NoteScript::from_package(&package("check-in-note")?)?.root();
+    let claim = NoteScript::from_package(&package("claim-note")?)?.root();
+    let deposit = NoteScript::from_package(&package("deposit-note")?)?.root();
+    let activation_script = NoteScript::from_package(&package("activate-vault-note")?)?;
+    let p2id = P2idNote::script_root();
+    let config = NetworkAccountConfigNote::script_root();
+    let sponsorship = FeeSponsorshipNote::script_root();
+    let expected_before = BTreeSet::from([
+        check_in,
+        claim,
+        deposit,
+        activation_script.root(),
+        config,
+        sponsorship,
+    ]);
+    ensure!(
+        network.allowed_notes().allowed_script_roots() == &expected_before,
+        "refusing activation: setup note roots are not exactly the expected pre-activation set"
+    );
+    ensure!(
+        !expected_before.contains(&p2id),
+        "refusing activation: P2ID bootstrap permission remains"
+    );
+    ensure!(
+        network.allowed_tx_scripts().allowed_script_roots()
+            == &BTreeSet::from([ExpirationTransactionScript::script_root()]),
+        "refusing activation: transaction-script allowlist is not expiration-only"
+    );
+    ensure!(
+        vault
+            .storage()
+            .get_item(&StorageSlotName::new(slot("activated"))?)?[0]
+            == Felt::ZERO,
+        "vault is already activated"
+    );
+    for (name, expected) in [
+        ("owner", owner),
+        ("beneficiary", beneficiary),
+        ("asset_faucet", asset_faucet),
+    ] {
+        ensure!(
+            vault
+                .storage()
+                .get_item(&StorageSlotName::new(slot(name))?)?
+                == owner_word(expected),
+            "refusing activation: vault {name} differs from configured value"
+        );
+    }
+    ensure!(
+        vault
+            .storage()
+            .get_item(&StorageSlotName::new(slot("timeout_blocks"))?)?[0]
+            == Felt::from(timeout),
+        "refusing activation: timeout differs from configured value"
+    );
+
+    let mut random = rng();
+    let activation_note: Note = NoteBuilder::new(owner, &mut random)
+        .tag(NoteTag::with_account_target(vault_id).into())
+        .note_type(NoteType::Public)
+        .script(activation_script.clone())
+        .attachment(network_target(vault_id)?)
+        .build()?;
+    assert_network_target(&activation_note, vault_id)?;
+    let activation_note_id = activation_note.id();
+    let fee_faucet = parse_id(FEE_FAUCET)?;
+    let sponsorship_amount = 120u64;
+    let sponsorship_note: Note = FeeSponsorshipNote::builder()
+        .sender(owner)
+        .target_account(vault_id)
+        .feature_note_id(activation_note_id)
+        .asset(FungibleAsset::new(fee_faucet, sponsorship_amount)?)
+        .generate_serial_number(&mut random)
+        .build()?
+        .into();
+    let sponsorship_id = sponsorship_note.id();
+    let owner_tx = client
+        .submit_new_transaction(
+            owner,
+            TransactionRequestBuilder::new()
+                .own_output_notes([activation_note.clone(), sponsorship_note.clone()])
+                .expected_ntx_scripts(vec![activation_script, FeeSponsorshipNote::script()])
+                .build()?,
+        )
+        .await?;
+    let owner_block = committed_block(&mut client, owner_tx).await?;
+    let (_, vault_tx, committed_block) =
+        wait_for_network_execution(activation_note_id, vault_id, owner_block.as_u32(), policy)
+            .await?;
+    client.sync_state().await?;
+    let activated = client
+        .get_account(vault_id)
+        .await?
+        .context("vault is missing after activation")?;
+    let activated_network = NetworkAccount::new(activated.clone())?;
+    ensure!(
+        activated
+            .storage()
+            .get_item(&StorageSlotName::new(slot("activated"))?)?[0]
+            == Felt::from(1u32),
+        "activation transaction did not set the one-way activation flag"
+    );
+    let expected_after = BTreeSet::from([check_in, claim, deposit, sponsorship]);
+    ensure!(
+        activated_network.allowed_notes().allowed_script_roots() == &expected_after,
+        "activation did not freeze the exact Heirbeat/sponsorship note allowlist"
+    );
+    ensure!(
+        activated_network
+            .allowed_tx_scripts()
+            .allowed_script_roots()
+            == &BTreeSet::from([ExpirationTransactionScript::script_root()]),
+        "activation changed the transaction-script allowlist"
+    );
+    for (name, expected) in [
+        ("owner", owner),
+        ("beneficiary", beneficiary),
+        ("asset_faucet", asset_faucet),
+    ] {
+        ensure!(
+            activated
+                .storage()
+                .get_item(&StorageSlotName::new(slot(name))?)?
+                == owner_word(expected),
+            "activation changed vault {name}"
+        );
+    }
+    ensure!(
+        activated
+            .storage()
+            .get_item(&StorageSlotName::new(slot("timeout_blocks"))?)?[0]
+            == Felt::from(timeout)
+            && activated
+                .storage()
+                .get_item(&StorageSlotName::new(slot("last_check_in"))?)?
+                == Word::default()
+            && activated
+                .storage()
+                .get_item(&StorageSlotName::new(slot("claimed"))?)?
+                == Word::default(),
+        "activation changed timeout or lifecycle state"
+    );
+    println!("activation_note_id={activation_note_id}");
+    println!("activation_sponsorship_note_id={sponsorship_id}");
+    println!("activation_funding_transaction={owner_tx}");
+    println!("activation_network_transaction={vault_tx}");
+    println!("activation_committed_block={committed_block}");
+    println!("activation_sponsorship_amount={sponsorship_amount}");
+    println!("activated=true config_root_removed=true activation_root_removed=true");
+    println!(
+        "post_activation_note_allowlist={:?}",
+        activated_network.allowed_notes().allowed_script_roots()
+    );
+    Ok((
+        activation_note_id.to_string(),
+        sponsorship_id.to_string(),
+        owner_tx.to_string(),
+        vault_tx,
     ))
 }
 
@@ -1934,6 +2153,13 @@ async fn submit_feature_command(
         .as_canonical_u64()
         != 0;
     ensure_unclaimed(claimed, kind)?;
+    ensure!(
+        vault
+            .storage()
+            .get_item(&StorageSlotName::new(slot("activated"))?)?[0]
+            == Felt::from(1u32),
+        "vault is not activated; feature notes are disabled until configuration is frozen"
+    );
     let last_check_in = vault
         .storage()
         .get_item(&StorageSlotName::new(slot("last_check_in"))?)?[0]
@@ -1956,8 +2182,9 @@ async fn submit_feature_command(
         NoteScript::from_package(&package("check-in-note")?)?.root(),
         NoteScript::from_package(&package("claim-note")?)?.root(),
         NoteScript::from_package(&package("deposit-note")?)?.root(),
-        NetworkAccountConfigNote::script_root(),
         FeeSponsorshipNote::script_root(),
+        NetworkAccountConfigNote::script_root(),
+        NoteScript::from_package(&package("activate-vault-note")?)?.root(),
         P2idNote::script_root(),
         ExpirationTransactionScript::script_root(),
     )?;
@@ -2595,27 +2822,74 @@ async fn main() -> Result<()> {
                 config.save(&config_path)?;
                 id
             };
-            let finalized = config.public_ids.contains_key("pending_vault")
-                && verify_vault(vault, owner, beneficiary, faucet, timeout)
-                    .await
-                    .is_ok();
-            if !finalized {
-                let (config_note, sponsorship_note, owner_tx, ntx_tx) =
-                    remove_bootstrap_p2id(vault, owner, beneficiary, faucet, timeout, policy)
-                        .await?;
+            client.sync_state().await?;
+            let staged_account = client
+                .get_account(vault)
+                .await?
+                .context("pending vault is not available after deployment")?;
+            let activated = staged_account
+                .storage()
+                .get_item(&StorageSlotName::new(slot("activated"))?)?[0]
+                == Felt::from(1u32);
+            if activated {
+                verify_vault(vault, owner, beneficiary, faucet, timeout).await?;
+            } else {
+                let staged_network = NetworkAccount::new(staged_account.clone())?;
+                let p2id = P2idNote::script_root();
+                if staged_network
+                    .allowed_notes()
+                    .allowed_script_roots()
+                    .contains(&p2id)
+                {
+                    let (config_note, sponsorship_note, owner_tx, ntx_tx) =
+                        remove_bootstrap_p2id(vault, owner, beneficiary, faucet, timeout, policy)
+                            .await?;
+                    config
+                        .public_ids
+                        .insert("bootstrap_cleanup_config_note".into(), config_note);
+                    config.public_ids.insert(
+                        "bootstrap_cleanup_sponsorship_note".into(),
+                        sponsorship_note,
+                    );
+                    config
+                        .public_ids
+                        .insert("bootstrap_cleanup_funding_transaction".into(), owner_tx);
+                    config
+                        .public_ids
+                        .insert("bootstrap_cleanup_network_transaction".into(), ntx_tx);
+                } else {
+                    let check_in = NoteScript::from_package(&package("check-in-note")?)?.root();
+                    let claim = NoteScript::from_package(&package("claim-note")?)?.root();
+                    let deposit = NoteScript::from_package(&package("deposit-note")?)?.root();
+                    let activation =
+                        NoteScript::from_package(&package("activate-vault-note")?)?.root();
+                    let expected_setup = BTreeSet::from([
+                        check_in,
+                        claim,
+                        deposit,
+                        activation,
+                        NetworkAccountConfigNote::script_root(),
+                        FeeSponsorshipNote::script_root(),
+                    ]);
+                    ensure!(
+                        staged_network.allowed_notes().allowed_script_roots() == &expected_setup,
+                        "pending vault has unexpected pre-activation roots; refusing to activate"
+                    );
+                }
+                let (activation_note, activation_sponsorship, owner_tx, ntx_tx) =
+                    activate_vault(vault, owner, beneficiary, faucet, timeout, policy).await?;
                 config
                     .public_ids
-                    .insert("bootstrap_cleanup_config_note".into(), config_note);
-                config.public_ids.insert(
-                    "bootstrap_cleanup_sponsorship_note".into(),
-                    sponsorship_note,
-                );
+                    .insert("activation_note".into(), activation_note);
                 config
                     .public_ids
-                    .insert("bootstrap_cleanup_funding_transaction".into(), owner_tx);
+                    .insert("activation_sponsorship_note".into(), activation_sponsorship);
                 config
                     .public_ids
-                    .insert("bootstrap_cleanup_network_transaction".into(), ntx_tx);
+                    .insert("activation_funding_transaction".into(), owner_tx);
+                config
+                    .public_ids
+                    .insert("activation_network_transaction".into(), ntx_tx);
                 verify_vault(vault, owner, beneficiary, faucet, timeout).await?;
             }
             config.vault = Some(vault.to_string());

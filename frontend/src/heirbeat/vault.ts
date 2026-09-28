@@ -1,5 +1,6 @@
-import { AccountId, Endpoint, RpcClient, wordToBigInt } from "@miden-sdk/miden-sdk";
+import { AccountId, BasicFungibleFaucetComponent, Endpoint, RpcClient, wordToBigInt } from "@miden-sdk/miden-sdk";
 import type { MidenClient } from "@miden-sdk/miden-sdk";
+import { parseVaultAccountId, VaultReadError, type VaultReadDiagnostic } from "../domain/open-vault";
 import type { VaultSnapshot } from "../domain/types";
 
 const SLOT_PREFIX = "heirbeat_vault::heirbeat_vault::";
@@ -49,33 +50,110 @@ export async function readVault(client: MidenClient, accountId: string, currentR
   } finally { id.free(); }
 }
 
-/** Reads a public Network Account directly through a fresh RPC wrapper, without a cached client. */
-export async function readVaultFromRpc(endpoint: string, accountId: string): Promise<{ snapshot: VaultSnapshot; syncedBlock: number }> {
-  const rpc = new RpcClient(new Endpoint(endpoint));
+/** Reads a public Network Account through a fresh RPC wrapper and returns plain domain data. */
+export async function readVaultFromRpc(endpoint: string, accountId: string): Promise<{ snapshot: VaultSnapshot; syncedBlock: number; diagnostics: VaultReadDiagnostic[] }> {
+  let stage = "initialize_client";
+  let rpc: RpcClient | undefined;
   let id: AccountId | undefined;
   let header: Awaited<ReturnType<RpcClient["getBlockHeaderByNumber"]>> | undefined;
   let feeFaucet: AccountId | undefined;
   let fetched: Awaited<ReturnType<RpcClient["getAccountDetails"]>> | undefined;
   let account: ReturnType<NonNullable<typeof fetched>["account"]> | undefined;
+  let operationError: unknown;
   try {
-    id = AccountId.fromHex(accountId);
+    rpc = new RpcClient(new Endpoint(endpoint));
+    stage = "parse_account_id";
+    id = AccountId.fromHex(parseVaultAccountId(accountId));
+    stage = "sync_client";
     header = await rpc.getBlockHeaderByNumber(undefined, false);
     const syncedBlock = header.blockNum();
     feeFaucet = header.feeFaucetId();
+
+    stage = "import_or_get_account";
     fetched = await rpc.getAccountDetails(id);
+
+    stage = "read_account";
     account = fetched.account();
-    if (!account) throw new Error("The supplied account is not publicly readable from this RPC endpoint.");
+    if (!account) throw new Error("Account not found on Miden Testnet.");
     if (!account.isNetworkAccount()) throw new Error("The supplied account is not a Network Account.");
+
+    stage = "decode_vault_state";
     const snapshot = decodeVaultAccount(account as unknown as ImportedAccount, id.toString(), syncedBlock, feeFaucet.toString());
-    return { snapshot, syncedBlock };
+
+    stage = "read_faucet_metadata";
+    const metadataResult = await readFaucetMetadata(rpc, snapshot.faucet);
+    const diagnostics: VaultReadDiagnostic[] = metadataResult.diagnostic ? [metadataResult.diagnostic] : [];
+    const metadata = metadataResult.metadata;
+    if (metadata) {
+      snapshot.inheritedAssetSymbol = metadata.symbol;
+      snapshot.inheritedAssetName = metadata.name;
+      snapshot.inheritedAssetDecimals = metadata.decimals;
+    }
+    return { snapshot, syncedBlock, diagnostics };
+  } catch (cause) {
+    operationError = cause;
+    if (cause instanceof VaultReadError) throw cause;
+    throw new VaultReadError(stage, cause);
   } finally {
-    account?.free();
-    fetched?.free();
-    feeFaucet?.free();
-    header?.free();
-    id?.free();
-    rpc.free();
+    const cleanupErrors: VaultReadDiagnostic[] = [];
+    const dispose = (name: string, action: (() => void) | undefined) => {
+      if (!action) return;
+      try { action(); }
+      catch (cause) { cleanupErrors.push(new VaultReadError(`dispose_cleanup:${name}`, cause)); }
+    };
+    dispose("account", account ? () => account!.free() : undefined);
+    dispose("fetched_account", fetched ? () => fetched!.free() : undefined);
+    dispose("fee_faucet_id", feeFaucet ? () => feeFaucet!.free() : undefined);
+    dispose("block_header", header ? () => header!.free() : undefined);
+    dispose("account_id", id ? () => id!.free() : undefined);
+    dispose("rpc_client", rpc ? () => rpc!.free() : undefined);
+    if (operationError === undefined && cleanupErrors.length > 0) {
+      throw cleanupErrors[0];
+    }
   }
+}
+
+/** Faucet display metadata is auxiliary; failures stay visible in developer details. */
+async function readFaucetMetadata(rpc: RpcClient, faucetId: string): Promise<{ metadata?: { symbol: string; name: string; decimals: number }; diagnostic?: VaultReadDiagnostic }> {
+  let id: AccountId | undefined;
+  let fetched: Awaited<ReturnType<RpcClient["getAccountDetails"]>> | undefined;
+  let account: ReturnType<NonNullable<typeof fetched>["account"]> | undefined;
+  let component: BasicFungibleFaucetComponent | undefined;
+  let symbol: ReturnType<BasicFungibleFaucetComponent["symbol"]> | undefined;
+  let stage = "parse_faucet_account_id";
+  let metadata: { symbol: string; name: string; decimals: number } | undefined;
+  let diagnostic: VaultReadDiagnostic | undefined;
+  try {
+    id = AccountId.fromHex(faucetId);
+    stage = "get_faucet_account";
+    fetched = await rpc.getAccountDetails(id);
+    stage = "read_faucet_account";
+    account = fetched.account();
+    if (account?.isFaucet()) {
+      stage = "decode_faucet_metadata";
+      // SDK 0.16.3's generated binding calls account.__destroy_into_raw()
+      // before handing the pointer to Rust. Ownership transfers even if the
+      // Rust call throws, so this wrapper must never be explicitly freed here.
+      const transferredAccount = account;
+      account = undefined;
+      component = BasicFungibleFaucetComponent.fromAccount(transferredAccount);
+      symbol = component.symbol();
+      metadata = { symbol: symbol.toString(), name: component.tokenName(), decimals: component.decimals() };
+    }
+  } catch (cause) {
+    diagnostic = new VaultReadError(`read_faucet_metadata:${stage}`, cause);
+  }
+  const dispose = (name: string, action: (() => void) | undefined) => {
+    if (!action) return;
+    try { action(); }
+    catch (cause) { diagnostic ??= new VaultReadError(`read_faucet_metadata:dispose_${name}`, cause); }
+  };
+  dispose("symbol", symbol ? () => symbol!.free() : undefined);
+  dispose("component", component ? () => component!.free() : undefined);
+  dispose("account", account ? () => account!.free() : undefined);
+  dispose("fetched_account", fetched ? () => fetched!.free() : undefined);
+  dispose("account_id", id ? () => id!.free() : undefined);
+  return diagnostic ? { diagnostic } : { metadata };
 }
 
 function decodeVaultAccount(account: ImportedAccount, accountId: string, currentReferenceBlock: number, nativeFeeFaucet: string): VaultSnapshot {

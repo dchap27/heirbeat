@@ -5,7 +5,8 @@ export type VaultLifecycleState =
   | "warning"
   | "claimable"
   | "claimPending"
-  | "claimed";
+  | "claimed"
+  | "unknown";
 export type OperationStatus =
   | "preparing"
   | "walletSubmitted"
@@ -31,6 +32,9 @@ export interface VaultSnapshot {
   noteAllowlist: string[];
   transactionScriptAllowlist: string[];
   currentReferenceBlock: number;
+  inheritedAssetSymbol?: string;
+  inheritedAssetName?: string;
+  inheritedAssetDecimals?: number;
 }
 
 export interface DerivedVaultState {

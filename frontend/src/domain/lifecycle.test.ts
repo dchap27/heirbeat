@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { AccountId, AccountInterface, NetworkId } from "@miden-sdk/miden-sdk";
-import { deriveDeadline, deriveLifecycle, deriveRole } from "./lifecycle";
+import { deriveDeadline, deriveLifecycle, deriveRole, deriveRoleWithDiagnostic } from "./lifecycle";
 import type { VaultSnapshot } from "./types";
 
 const base: VaultSnapshot = {
@@ -20,7 +20,9 @@ describe("Heirbeat browser domain derivations", () => {
 
   it("derives lifecycle and role without mutating chain state", () => {
     expect(deriveLifecycle(base).lifecycle).toBe("active");
-    expect(deriveLifecycle({ ...base, currentReferenceBlock: 109 }).lifecycle).toBe("warning");
+    // No warning threshold is defined by product policy, so pre-deadline
+    // blocks remain Active instead of inventing a warning window.
+    expect(deriveLifecycle({ ...base, currentReferenceBlock: 109 }).lifecycle).toBe("active");
     expect(deriveLifecycle({ ...base, currentReferenceBlock: 110 }).lifecycle).toBe("claimable");
     expect(deriveLifecycle({ ...base, claimed: true }).lifecycle).toBe("claimed");
     expect(deriveLifecycle({ ...base, activated: false }).lifecycle).toBe("setup");
@@ -29,6 +31,11 @@ describe("Heirbeat browser domain derivations", () => {
     expect(deriveRole(owner.toUpperCase().replace("0X", "0x"), owner, beneficiary)).toBe("owner");
     expect(deriveRole(beneficiary, owner, beneficiary)).toBe("beneficiary");
     expect(deriveRole(null, owner, beneficiary)).toBe("observer");
+    expect(deriveRole("mtst1not-a-real-account", owner, beneficiary)).toBe("observer");
+    expect(deriveRoleWithDiagnostic("malformed-address", owner, beneficiary)).toMatchObject({
+      role: "observer",
+      diagnostic: { stage: "derive_role" },
+    });
   });
 
   it("normalizes the wallet adapter's Bech32 address before role comparison", () => {

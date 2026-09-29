@@ -79,6 +79,10 @@ export async function readVaultFromRpc(endpoint: string, accountId: string): Pro
 
     stage = "decode_vault_state";
     const snapshot = decodeVaultAccount(account as unknown as ImportedAccount, id.toString(), syncedBlock, feeFaucet.toString());
+    stage = "read_fee_policy";
+    const verificationBaseFee = header.verificationBaseFee();
+    if (!Number.isSafeInteger(verificationBaseFee) || verificationBaseFee < 0) throw new Error("Node returned an invalid verification base fee.");
+    snapshot.verificationBaseFee = BigInt(verificationBaseFee);
 
     stage = "read_faucet_metadata";
     const metadataResult = await readFaucetMetadata(rpc, snapshot.faucet);

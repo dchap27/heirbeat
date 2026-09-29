@@ -12,7 +12,7 @@ import {
   VaultDashboard,
 } from "./VaultDashboard";
 
-const owner = "0xa61714a99ec761910e397cbac32cd";
+const owner = "0xa61714a99ec7619109e397cbac32cd";
 const beneficiary = "0x4181277bcf64381105ee61baadb5bc";
 const snapshot: VaultSnapshot = {
   accountId: "0xc01fe4f8003940514cdfc0bb2be577",
@@ -72,10 +72,10 @@ describe("read-only product surfaces", () => {
     expect(html).not.toContain("<button");
   });
 
-  it("keeps owner and beneficiary actions disabled until live action support exists", () => {
+  it("enables the owner check-in surface while keeping other actions disabled", () => {
     const active = { ...snapshot, claimed: false, currentReferenceBlock: 507645 };
     const ownerHtml = renderToStaticMarkup(<VaultActions snapshot={active} role="owner" />);
-    expect(ownerHtml).toContain("Check in · coming soon");
+    expect(ownerHtml).toContain("Deposit · coming soon");
     expect(ownerHtml).toContain("disabled");
     const beneficiaryHtml = renderToStaticMarkup(<VaultActions snapshot={active} role="beneficiary" />);
     expect(beneficiaryHtml).toContain("Claim becomes available at block 507646");
@@ -83,6 +83,27 @@ describe("read-only product surfaces", () => {
     const claimableHtml = renderToStaticMarkup(<VaultActions snapshot={{ ...active, currentReferenceBlock: 507646 }} role="beneficiary" />);
     expect(claimableHtml).toContain("Claim is available");
     expect(claimableHtml).toContain("disabled");
+  });
+
+  it("offers the production check-in only to the connected owner of an active vault", () => {
+    const active = { ...snapshot, claimed: false, currentReferenceBlock: 507645, verificationBaseFee: 2n };
+    const ownerHtml = renderToStaticMarkup(<VaultDashboard
+      snapshot={active}
+      connectedAccount={owner}
+      walletConnected
+      endpoint="https://rpc.testnet.miden.io"
+      requestAssets={async () => [{ faucetId: active.nativeFeeFaucet, amount: "500" }]}
+      requestTransaction={async () => "tx"}
+      onClose={() => {}}
+    />);
+    expect(ownerHtml).toContain("Check in to this vault");
+    expect(ownerHtml).toContain("This check-in affects this vault only");
+    expect(ownerHtml).toContain("Required for sponsorship + fee reserve");
+    expect(ownerHtml).not.toContain("Check in · coming soon");
+
+    const beneficiaryHtml = renderToStaticMarkup(<VaultDashboard snapshot={active} connectedAccount={beneficiary} endpoint="https://rpc.testnet.miden.io" onClose={() => {}} />);
+    expect(beneficiaryHtml).not.toContain("Check in to this vault");
+    expect(beneficiaryHtml).toContain("No owner actions are available");
   });
 
   it("renders advanced raw on-chain details separately", () => {

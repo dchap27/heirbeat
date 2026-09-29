@@ -32,6 +32,8 @@ export interface VaultSnapshot {
   noteAllowlist: string[];
   transactionScriptAllowlist: string[];
   currentReferenceBlock: number;
+  /** Chain header's native verification base fee; absent on legacy client reads. */
+  verificationBaseFee?: bigint;
   inheritedAssetSymbol?: string;
   inheritedAssetName?: string;
   inheritedAssetDecimals?: number;

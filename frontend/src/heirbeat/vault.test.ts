@@ -109,7 +109,7 @@ describe("read Heirbeat vault", () => {
     const vaultAccount = makeAccount();
     const metadataAccount = makeAccount();
     const makeFetched = (account: ReturnType<typeof makeAccount>) => ({ account: () => account, free: vi.fn() });
-    const header = { blockNum: () => 507700, feeFaucetId: () => AccountId.fromHex(nativeFaucetId), free: vi.fn() };
+    const header = { blockNum: () => 507700, feeFaucetId: () => AccountId.fromHex(nativeFaucetId), verificationBaseFee: () => 2, free: vi.fn() };
     const byAccountId = vi.spyOn(RpcClient.prototype, "getAccountDetails")
       .mockImplementation(async (requested) => makeFetched(requested.toString() === accountId ? vaultAccount : metadataAccount) as never);
     const byBlock = vi.spyOn(RpcClient.prototype, "getBlockHeaderByNumber").mockResolvedValue(header as never);
@@ -159,7 +159,7 @@ describe("read Heirbeat vault", () => {
       free: vi.fn(),
     };
     const fetched = { account: () => account, free: vi.fn() };
-    const header = { blockNum: () => 507700, feeFaucetId: () => AccountId.fromHex(nativeFaucetId), free: vi.fn() };
+    const header = { blockNum: () => 507700, feeFaucetId: () => AccountId.fromHex(nativeFaucetId), verificationBaseFee: () => 2, free: vi.fn() };
     const details = vi.spyOn(RpcClient.prototype, "getAccountDetails")
       .mockResolvedValueOnce(fetched as never)
       .mockRejectedValueOnce(new Error("null pointer passed to rust"));
@@ -213,7 +213,7 @@ describe("read Heirbeat vault", () => {
     const details = vi.spyOn(RpcClient.prototype, "getAccountDetails")
       .mockResolvedValueOnce(fetchedVault as never)
       .mockResolvedValueOnce(fetchedFaucet as never);
-    const header = { blockNum: () => 507700, feeFaucetId: () => AccountId.fromHex(nativeFaucetId), free: vi.fn() };
+    const header = { blockNum: () => 507700, feeFaucetId: () => AccountId.fromHex(nativeFaucetId), verificationBaseFee: () => 2, free: vi.fn() };
     const block = vi.spyOn(RpcClient.prototype, "getBlockHeaderByNumber").mockResolvedValue(header as never);
     const rpcFree = vi.spyOn(RpcClient.prototype, "free").mockImplementation(() => {});
     try {

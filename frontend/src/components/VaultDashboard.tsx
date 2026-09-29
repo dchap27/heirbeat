@@ -1,8 +1,13 @@
 import { useState } from "react";
+import type { ReactNode } from "react";
 import { deriveDeadline, deriveLifecycle, deriveRoleWithDiagnostic } from "../domain/lifecycle";
 import { formatAssetAmount, shortenedAccountId, type VaultReadDiagnostic } from "../domain/open-vault";
 import type { VaultLifecycleState, VaultRole, VaultSnapshot } from "../domain/types";
 import { readNtxStatus } from "../miden/ntx";
+import { CheckInAction, CHECK_IN_STATE_LABELS } from "./CheckInAction";
+import type { CheckInRecord } from "../domain/check-in";
+import type { Asset } from "@miden-sdk/miden-wallet-adapter";
+import type { Transaction } from "@miden-sdk/miden-wallet-adapter";
 
 const lifecycleLabels: Record<VaultLifecycleState, string> = {
   setup: "Setup",
@@ -120,25 +125,42 @@ export function LifecycleTimeline({ state }: { state: VaultLifecycleState }) {
   </section>;
 }
 
-export function VaultActions({ snapshot, role }: { snapshot: VaultSnapshot; role: VaultRole }) {
+export function VaultActions({ snapshot, role, checkInAction }: { snapshot: VaultSnapshot; role: VaultRole; checkInAction?: ReactNode }) {
   const state = deriveLifecycle(snapshot);
   if (snapshot.claimed) return <section className="product-card actions-card"><div className="section-kicker">Next step</div><h2>Inheritance claimed</h2><p>This vault is terminal. No further heartbeat, deposit, or claim action is available.</p></section>;
-  if (role === "observer") return <section className="product-card actions-card"><div className="section-kicker">Vault actions</div><h2>Read-only access</h2><p>Only the configured owner can check in or deposit. Only the beneficiary can claim when eligible.</p></section>;
+  if (role === "observer") return <section className="product-card actions-card"><div className="section-kicker">Vault actions</div><h2>Read-only access</h2><p>{snapshot.activated ? "Connect the vault owner's wallet to check in." : "Only the configured owner can check in or deposit. Only the beneficiary can claim when eligible."}</p></section>;
   if (!snapshot.activated) return role === "owner"
     ? <section className="product-card actions-card"><div className="section-kicker">Owner actions</div><h2>Review & finalize vault</h2><p>Finalization permanently locks the inheritance policy.</p><button className="button button-disabled" disabled aria-describedby="action-coming">Coming in next implementation step</button><span id="action-coming" className="field-help">Live wallet actions are not enabled in this release.</span></section>
     : <section className="product-card actions-card"><div className="section-kicker">Beneficiary actions</div><h2>Vault setup in progress</h2><p>Claiming is unavailable until the owner finalizes the vault and the inactivity deadline passes.</p></section>;
-  if (role === "owner") return <section className="product-card actions-card"><div className="section-kicker">Owner actions</div><h2>Keep the vault active</h2><div className="action-buttons"><button className="button button-disabled" disabled>Check in · coming soon</button><button className="button button-disabled" disabled>Deposit · coming soon</button></div><p className="field-help">These controls are intentionally not connected to wallet submission yet.</p></section>;
   if (role === "beneficiary") return <section className="product-card actions-card"><div className="section-kicker">Beneficiary actions</div><h2>{state.eligible ? "Claim is available" : "Claim not yet available"}</h2>
+    <p>No owner actions are available for this wallet.</p>
     <button className="button button-disabled" disabled aria-describedby="claim-reason">Claim inheritance · coming soon</button>
     <p id="claim-reason" className="field-help">{state.eligible ? "Live wallet actions are not enabled in this release." : `Claim becomes available at block ${state.deadline}. ${state.remainingBlocks} blocks remain.`}</p>
   </section>;
+  if (role === "owner") return <>
+    {checkInAction}
+    <section className="product-card actions-card"><div className="section-kicker">Owner actions</div><h2>Other vault actions</h2><button className="button button-disabled" disabled>Deposit · coming soon</button><p className="field-help">Deposit is not connected to wallet submission.</p></section>
+  </>;
   return null;
 }
 
-export function NetworkExecutionStatus() {
+export function NetworkExecutionStatus({ record }: { record?: CheckInRecord }) {
+  const label = record ? ({
+    idle: "No operation in progress",
+    preparing: "Preparing request",
+    wallet_review: "Wallet review",
+    wallet_rejected: "Check-in canceled",
+    wallet_accepted: "Wallet accepted · awaiting chain evidence",
+    feature_note_committed: "Feature note committed · awaiting execution",
+    ntx_pending: "Waiting for Miden execution",
+    ntx_executing: "Executing on Miden",
+    executed: "Check-in confirmed",
+    failed: "Check-in failed",
+    unknown: "Execution status unknown",
+  } as const)[record.state] : "No operation in progress";
   return <section className="network-execution" aria-labelledby="network-execution-title">
-    <div className="execution-icon" aria-hidden="true">↗</div><div><div className="section-kicker">Network execution</div><h2 id="network-execution-title">No operation in progress</h2><p>Wallet review and Network Account execution are separate steps. This dashboard only shows confirmed chain state.</p></div>
-    <span className="execution-state">Idle</span>
+    <div className="execution-icon" aria-hidden="true">↗</div><div><div className="section-kicker">Network execution</div><h2 id="network-execution-title">{label}</h2><p>{record?.message ?? "Wallet review and Network Account execution are separate steps. This dashboard only shows confirmed chain state."}</p></div>
+    <span className="execution-state">{record ? CHECK_IN_STATE_LABELS[record.state] : "Idle"}</span>
   </section>;
 }
 
@@ -198,17 +220,36 @@ function NtxStatusLookup({ endpoint }: { endpoint: string }) {
   </div>;
 }
 
-export function VaultDashboard({ snapshot, connectedAccount, endpoint, diagnostics = [], onClose }: {
+export function VaultDashboard({ snapshot, connectedAccount, endpoint, diagnostics = [], onClose, walletConnected = false, requestAssets, requestTransaction, checkInRecord, onCheckInRecord, onSnapshotRefresh }: {
   snapshot: VaultSnapshot;
   connectedAccount: string | null;
   endpoint: string;
   diagnostics?: VaultReadDiagnostic[];
   onClose: () => void;
+  walletConnected?: boolean;
+  requestAssets?: () => Promise<Asset[]>;
+  requestTransaction?: (transaction: Transaction) => Promise<string>;
+  checkInRecord?: CheckInRecord;
+  onCheckInRecord?: (record: CheckInRecord | undefined) => void;
+  onSnapshotRefresh?: (snapshot: VaultSnapshot) => void;
 }) {
   const roleResult = deriveRoleWithDiagnostic(connectedAccount, snapshot.owner, snapshot.beneficiary);
   const role = roleResult.role;
   const allDiagnostics = roleResult.diagnostic ? [...diagnostics, roleResult.diagnostic] : diagnostics;
   const lifecycle = deriveLifecycle(snapshot).lifecycle;
+  const checkInAction = role === "owner" && snapshot.activated && !snapshot.claimed
+    ? <CheckInAction
+        snapshot={snapshot}
+        endpoint={endpoint}
+        connectedAccount={connectedAccount}
+        walletConnected={walletConnected}
+        requestAssets={requestAssets}
+        requestTransaction={requestTransaction}
+        record={checkInRecord}
+        onRecord={(record) => onCheckInRecord?.(record)}
+        onSnapshot={(fresh) => onSnapshotRefresh?.(fresh)}
+      />
+    : undefined;
   return <div className="vault-page">
     <VaultHeader snapshot={snapshot} role={role} onClose={onClose} />
     <VaultStatusCard snapshot={snapshot} />
@@ -217,8 +258,8 @@ export function VaultDashboard({ snapshot, connectedAccount, endpoint, diagnosti
       <VaultPolicyCard snapshot={snapshot} />
     </div>
     <LifecycleTimeline state={lifecycle} />
-    <VaultActions snapshot={snapshot} role={role} />
-    <NetworkExecutionStatus />
+    <VaultActions snapshot={snapshot} role={role} checkInAction={checkInAction} />
+    <NetworkExecutionStatus record={checkInRecord} />
     <AdvancedVaultDetails snapshot={snapshot} endpoint={endpoint} diagnostics={allDiagnostics} />
   </div>;
 }

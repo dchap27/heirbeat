@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import {
   PrivateDataPermission,
   WalletAdapterNetwork,
@@ -11,12 +11,16 @@ import { OpenVaultForm } from "./components/OpenVaultForm";
 import { VaultDashboard } from "./components/VaultDashboard";
 import { classifyVaultReadError, parseVaultAccountId, parseVaultLocation, userSafeVaultError, VaultReadError, type VaultOpenStatus, type VaultReadDiagnostic } from "./domain/open-vault";
 import type { VaultSnapshot } from "./domain/types";
+import { CHECK_IN_RECORD_STORAGE_KEY, loadCheckInRecords, type CheckInRecord } from "./domain/check-in";
 import { readVaultFromRpc } from "./heirbeat/vault";
 import { TESTNET_ENDPOINTS } from "./miden/endpoints";
 import { planWalletConnectStep } from "./miden/connect-flow";
 import { CreateVaultPlaceholder, HomePage } from "./pages/HomePage";
 
 const endpoint = TESTNET_ENDPOINTS[0];
+const DevBootstrapFundingPreview = import.meta.env.DEV
+  ? lazy(() => import("./components/BootstrapFundingPreview").then((module) => ({ default: module.BootstrapFundingPreview })))
+  : null;
 const initialLocation = typeof window === "undefined"
   ? { accountId: null, requested: false }
   : parseVaultLocation(window.location.pathname, window.location.search);
@@ -32,6 +36,11 @@ export function App() {
   const [openDetail, setOpenDetail] = useState<string | null>(null);
   const [readDiagnostics, setReadDiagnostics] = useState<VaultReadDiagnostic[]>([]);
   const [snapshot, setSnapshot] = useState<VaultSnapshot | null>(null);
+  const [checkInRecords, setCheckInRecords] = useState<Record<string, CheckInRecord>>(() => {
+    if (typeof window === "undefined") return {};
+    try { return loadCheckInRecords(window.localStorage.getItem(CHECK_IN_RECORD_STORAGE_KEY)); }
+    catch { return {}; }
+  });
   const [walletError, setWalletError] = useState<string | null>(null);
   const [walletConnecting, setWalletConnecting] = useState(false);
   const pendingWalletName = useRef<string | null>(null);
@@ -137,6 +146,11 @@ export function App() {
     return () => window.removeEventListener("popstate", onPopState);
   }, [openVault]);
 
+  useEffect(() => {
+    try { window.localStorage.setItem(CHECK_IN_RECORD_STORAGE_KEY, JSON.stringify(checkInRecords)); }
+    catch { /* Local persistence is best-effort; all operation evidence remains chain-verifiable. */ }
+  }, [checkInRecords]);
+
   function closeVault() {
     setSnapshot(null);
     setVaultInput("");
@@ -150,8 +164,40 @@ export function App() {
     : view === "create"
       ? <CreateVaultPlaceholder onBack={() => navigate("home")} />
       : view === "dashboard" && snapshot
-        ? <VaultDashboard snapshot={snapshot} connectedAccount={wallet.connected ? wallet.address : null} endpoint={endpoint} diagnostics={readDiagnostics} onClose={closeVault} />
+        ? <VaultDashboard
+            snapshot={snapshot}
+            connectedAccount={wallet.connected ? wallet.address : null}
+            walletConnected={wallet.connected}
+            requestAssets={wallet.requestAssets ? () => wallet.requestAssets!() : undefined}
+            requestTransaction={wallet.requestTransaction ? (transaction) => wallet.requestTransaction!(transaction) : undefined}
+            checkInRecord={checkInRecords[snapshot.accountId.toLowerCase()]}
+            onCheckInRecord={(record) => setCheckInRecords((current) => {
+              const key = snapshot.accountId.toLowerCase();
+              if (!record) {
+                const next = { ...current };
+                delete next[key];
+                return next;
+              }
+              return { ...current, [key]: record };
+            })}
+            onSnapshotRefresh={(fresh) => {
+              if (fresh.accountId.toLowerCase() === snapshot.accountId.toLowerCase()) setSnapshot(fresh);
+            }}
+            endpoint={endpoint}
+            diagnostics={readDiagnostics}
+            onClose={closeVault}
+          />
         : <HomePage hasVault={snapshot !== null} onOpen={() => navigate("open")} onCreate={() => navigate("create")} />;
+
+  const renderedContent = <>
+    {content}
+    {DevBootstrapFundingPreview && <Suspense fallback={null}><DevBootstrapFundingPreview
+      connectedAddress={wallet.connected ? wallet.address : null}
+      walletConnected={wallet.connected}
+      requestAssets={wallet.requestAssets ? () => wallet.requestAssets!() : undefined}
+      requestTransaction={wallet.requestTransaction ? (transaction) => wallet.requestTransaction!(transaction) : undefined}
+    /></Suspense>}
+  </>;
 
   return <AppShell
     view={view}
@@ -163,5 +209,5 @@ export function App() {
     onNavigate={navigate}
     onConnect={connectWallet}
     onDisconnect={() => { setWalletError(null); void wallet.disconnect(); }}
-  >{content}</AppShell>;
+  >{renderedContent}</AppShell>;
 }
